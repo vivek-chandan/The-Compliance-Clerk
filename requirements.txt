@@ -1,0 +1,8 @@
+pymupdf
+pytesseract
+pillow
+pandas
+openai
+pydantic
+openpyxl
+tqdm
