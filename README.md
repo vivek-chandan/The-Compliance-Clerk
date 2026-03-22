@@ -107,5 +107,5 @@ The-Compliance-Clerk/
 │   ├── schema.py             # Defines data models (Pydantic) and field keywords
 │   └── validator.py          # Cleans and validates JSON output from LLMs
 ├── main.py                   # Main entry point of the application
-|── requirements.txt          # Lists all Python dependencies
+└── requirements.txt          # Lists all Python dependencies
 
