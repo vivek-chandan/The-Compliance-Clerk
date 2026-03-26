@@ -343,7 +343,7 @@ class HeuristicParser:
 
     def _salient_tokens(self, text: str) -> Sequence[str]:
         tokens: List[str] = []
-        for pattern in (ORDER_NUMBER_RE, VEHICLE_NUMBER_RE, DATE_RE, AMOUNT_RE, AREA_RE):
+        for pattern in (ORDER_NUMBER_RE, VEHICLE_NUMBER_RE, DATE_RE, AREA_RE):
             if pattern is AREA_RE:
                 tokens.extend([" ".join(match) for match in pattern.findall(text)])
             else:
