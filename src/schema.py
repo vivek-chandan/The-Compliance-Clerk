@@ -9,39 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 class DocumentType(str, Enum):
     NA_ORDER = "na_order"
     NA_LEASE = "na_lease"
-    ECHALLAN = "echallan"
     UNKNOWN = "unknown"
 
 
 class GroupType(str, Enum):
     NA = "na"
-    ECHALLAN = "echallan"
     UNKNOWN = "unknown"
 
-
-OUTPUT_COLUMNS = [
-    "sr no",
-    "Document Type",
-    "Source Files",
-    "Master Key",
-    "Challan Number",
-    "Vehicle Number",
-    "Violation Date",
-    "Amount",
-    "Offence Description",
-    "Payment Status",
-    "Owner Name",
-    "Authority Details",
-    "village",
-    "survey no",
-    "Land Area",
-    "Area in NA Order",
-    "Dated",
-    "NA Order No.",
-    "Lease Deed Doc. No.",
-    "Lease Area",
-    "Lease Start",
-]
 
 NA_EXPORT_COLUMNS = [
     "Sr.no.",
@@ -54,17 +28,6 @@ NA_EXPORT_COLUMNS = [
     "Lease Area ",
     "Lease Start ",
 ]
-
-ECHALLAN_EXPORT_COLUMNS = [
-    "Sr.no.",
-    "Challan Number",
-    "Vehicle Number",
-    "Violation Date",
-    "Amount",
-    "Offence Description",
-    "Payment Status",
-]
-
 
 NA_FIELD_KEYWORDS = {
     "Owner Name": ["owner", "occupant", "applicant", "lessee", "name"],
@@ -80,17 +43,6 @@ NA_FIELD_KEYWORDS = {
     "Lease Start": ["lease start", "commencement", "period", "effective"],
 }
 
-
-ECHALLAN_FIELD_KEYWORDS = {
-    "Challan Number": ["challan", "notice no", "application no"],
-    "Vehicle Number": ["vehicle", "registration", "regn", "plate"],
-    "Violation Date": ["date", "violation", "offence", "time"],
-    "Amount": ["amount", "fine", "penalty", "total"],
-    "Offence Description": ["offence", "violation", "description", "section"],
-    "Payment Status": ["status", "paid", "payment", "pending"],
-}
-
-
 class IdentityCard(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -102,9 +54,7 @@ class IdentityCard(BaseModel):
     grouping_basis: str
     survey_number: str = ""
     village: str = ""
-    challan_number: str = ""
     order_number: str = ""
-    vehicle_number: str = ""
     confidence: float = 0.0
     sample_text: str = ""
 
@@ -114,7 +64,7 @@ class PageText(BaseModel):
     filename: str
     page_number: int
     text: str
-    source: Literal["native", "ocr", "combined"] = "native"
+    source: Literal["native", "ocr"] = "native"
 
 
 class CandidateRecord(BaseModel):
@@ -124,12 +74,6 @@ class CandidateRecord(BaseModel):
     document_type: str = Field(default="", alias="Document Type")
     source_files: str = Field(default="", alias="Source Files")
     master_key: str = Field(default="", alias="Master Key")
-    challan_number: str = Field(default="", alias="Challan Number")
-    vehicle_number: str = Field(default="", alias="Vehicle Number")
-    violation_date: str = Field(default="", alias="Violation Date")
-    amount: str = Field(default="", alias="Amount")
-    offence_description: str = Field(default="", alias="Offence Description")
-    payment_status: str = Field(default="", alias="Payment Status")
     owner_name: str = Field(default="", alias="Owner Name")
     authority_details: str = Field(default="", alias="Authority Details")
     village: str = Field(default="", alias="village")
@@ -144,7 +88,23 @@ class CandidateRecord(BaseModel):
 
     def to_output_dict(self) -> Dict[str, str]:
         payload = self.model_dump(by_alias=True)
-        return {column: str(payload.get(column, "") or "") for column in OUTPUT_COLUMNS}
+        return {column: str(payload.get(column, "") or "") for column in [
+            "sr no",
+            "Document Type",
+            "Source Files",
+            "Master Key",
+            "Owner Name",
+            "Authority Details",
+            "village",
+            "survey no",
+            "Land Area",
+            "Area in NA Order",
+            "Dated",
+            "NA Order No.",
+            "Lease Deed Doc. No.",
+            "Lease Area",
+            "Lease Start",
+        ]}
 
     def filled_fields(self) -> Dict[str, str]:
         return {key: value for key, value in self.to_output_dict().items() if value and key != "sr no"}
@@ -184,20 +144,6 @@ KEY_ALIASES = {
     "source_files": "Source Files",
     "master key": "Master Key",
     "master_key": "Master Key",
-    "challan number": "Challan Number",
-    "challan_number": "Challan Number",
-    "challan no": "Challan Number",
-    "vehicle number": "Vehicle Number",
-    "vehicle_number": "Vehicle Number",
-    "vehicle no": "Vehicle Number",
-    "violation date": "Violation Date",
-    "violation_date": "Violation Date",
-    "amount": "Amount",
-    "offence description": "Offence Description",
-    "offence": "Offence Description",
-    "offence_description": "Offence Description",
-    "payment status": "Payment Status",
-    "payment_status": "Payment Status",
     "owner name": "Owner Name",
     "owner_name": "Owner Name",
     "authority details": "Authority Details",
@@ -248,13 +194,3 @@ def to_na_export_row(payload: Dict[str, object]) -> Dict[str, str]:
     }
 
 
-def to_echallan_export_row(payload: Dict[str, object]) -> Dict[str, str]:
-    return {
-        "Sr.no.": str(payload.get("sr no", "") or ""),
-        "Challan Number": str(payload.get("Challan Number", "") or ""),
-        "Vehicle Number": str(payload.get("Vehicle Number", "") or ""),
-        "Violation Date": str(payload.get("Violation Date", "") or ""),
-        "Amount": str(payload.get("Amount", "") or ""),
-        "Offence Description": str(payload.get("Offence Description", "") or ""),
-        "Payment Status": str(payload.get("Payment Status", "") or ""),
-    }

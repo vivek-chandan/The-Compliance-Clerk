@@ -8,7 +8,6 @@ import fitz
 
 from src.ocr import ocr_selected_pages
 from src.schema import (
-    ECHALLAN_FIELD_KEYWORDS,
     NA_FIELD_KEYWORDS,
     CandidateRecord,
     GroupType,
@@ -30,10 +29,6 @@ SURVEY_RE = re.compile(
     re.IGNORECASE,
 )
 VILLAGE_RE = re.compile(r"(?:village|moje)\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)", re.IGNORECASE)
-AMOUNT_RE = re.compile(
-    r"(?:amount|fine|penalty|total)\s*(?:rs\.?|inr)?\s*[:\-]?\s*([0-9,]+(?:\.\d{1,2})?)",
-    re.IGNORECASE,
-)
 AREA_RE = re.compile(
     r"([0-9,]+(?:\.\d+)?)\s*(sq\.?\s*m(?:trs?)?|sq\.?\s*ft|sqm|hectare|acre)",
     re.IGNORECASE,
@@ -46,7 +41,6 @@ AUTHORITY_RE = re.compile(
     r"((?:district\s+collector|collector|competent authority|deputy collector)[A-Za-z,\s\-]{0,120})",
     re.IGNORECASE,
 )
-PAYMENT_STATUS_RE = re.compile(r"\b(paid|unpaid|pending|disposed|cancelled)\b", re.IGNORECASE)
 LEASE_DEED_FILENAME_RE = re.compile(r"Lease Deed No\.[^\d]*(\d+)", re.IGNORECASE)
 DIRECT_SQM_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?\s*square\s*meters?", re.IGNORECASE)
 OUT_OF_SQM_RE = re.compile(r"out of\s*0?(\d{4,})\s*square\s*meter", re.IGNORECASE)
@@ -118,8 +112,6 @@ class HeuristicParser:
 
         if cluster.group_type == GroupType.NA:
             return self._fill_na_record(record, cluster, combined_text)
-        if cluster.group_type == GroupType.ECHALLAN:
-            return self._fill_echallan_record(record, cluster, combined_text)
         return record
 
     def collect_cluster_pages(self, cluster: ProcessingCluster) -> List[PageText]:
@@ -190,7 +182,7 @@ class HeuristicParser:
             normalized_text = page.text.lower()
             master_key_score = 0
             for card in cluster.identity_cards:
-                tokens = [card.master_key, card.survey_number, card.village, card.challan_number, card.order_number]
+                tokens = [card.master_key, card.survey_number, card.village, card.order_number]
                 for token in tokens:
                     if token and token.lower() in normalized_text:
                         master_key_score += 3
@@ -242,23 +234,14 @@ class HeuristicParser:
                     score += 4
                 if field_name in {"Lease Deed Doc. No.", "Lease Area", "Lease Start", "Owner Name"} and page_doc_type == "na_lease":
                     score += 4
-            elif cluster.group_type == GroupType.ECHALLAN and page_doc_type == "echallan":
-                score += 4
-
             if field_name in {"Area in NA Order", "Lease Area", "Land Area"}:
                 if self._extract_primary_sqm(page.text) or self._extract_property_detail_area(page.text):
                     score += 5
-            if field_name in {"Dated", "Lease Start", "Violation Date"} and DATE_RE.search(page.text):
+            if field_name in {"Dated", "Lease Start"} and DATE_RE.search(page.text):
                 score += 5
             if field_name == "NA Order No." and ORDER_NUMBER_RE.search(page.text):
                 score += 5
             if field_name == "Lease Deed Doc. No." and LEASE_DEED_FILENAME_RE.search(page.filename):
-                score += 5
-            if field_name == "Challan Number" and CHALLAN_NUMBER_RE.search(page.text):
-                score += 5
-            if field_name == "Vehicle Number" and VEHICLE_NUMBER_RE.search(page.text.upper()):
-                score += 5
-            if field_name == "Amount" and AMOUNT_RE.search(page.text):
                 score += 5
 
             if score > 0:
@@ -292,14 +275,14 @@ class HeuristicParser:
             for page_number in relevant_pages:
                 native_text = native_texts.get(page_number, "")
                 ocr_text = normalize_whitespace(ocr_texts.get(page_number, ""))
-                combined = "\n".join(part for part in [native_text, ocr_text] if part).strip()
-                source = "combined" if native_text and ocr_text else "ocr" if ocr_text else "native"
+                text = ocr_text or native_text
+                source = "ocr" if ocr_text else "native"
                 pages.append(
                     PageText(
                         file_path=pdf_path,
                         filename=pdf_name(pdf_path),
                         page_number=page_number + 1,
-                        text=combined or native_text or ocr_text,
+                        text=text,
                         source=source,
                     )
                 )
@@ -348,37 +331,9 @@ class HeuristicParser:
 
         return record
 
-    def _fill_echallan_record(self, record: CandidateRecord, cluster: ProcessingCluster, text: str) -> CandidateRecord:
-        first_card = cluster.identity_cards[0]
-        challan_match = CHALLAN_NUMBER_RE.search(text)
-        vehicle_match = VEHICLE_NUMBER_RE.search(text.upper())
-        date_match = DATE_RE.search(text)
-        amount_match = AMOUNT_RE.search(text)
-        payment_status = PAYMENT_STATUS_RE.search(text)
-        offence_match = re.search(
-            r"(?:offence|violation|description)\s*[:\-]?\s*([A-Za-z0-9,;:\-\s]{10,200})",
-            text,
-            re.IGNORECASE,
-        )
-
-        record.challan_number = first_card.challan_number or (challan_match.group(1).upper() if challan_match else "")
-        record.vehicle_number = first_card.vehicle_number or (vehicle_match.group(0) if vehicle_match else "")
-        if date_match:
-            record.violation_date = date_match.group(0)
-        if amount_match:
-            record.amount = amount_match.group(1)
-        if offence_match:
-            record.offence_description = normalize_whitespace(offence_match.group(1))
-        if payment_status:
-            record.payment_status = payment_status.group(1).title()
-
-        return record
-
     def _field_keywords(self, group_type: GroupType) -> Dict[str, List[str]]:
         if group_type == GroupType.NA:
             return NA_FIELD_KEYWORDS
-        if group_type == GroupType.ECHALLAN:
-            return ECHALLAN_FIELD_KEYWORDS
         return {}
 
     def _missing_fields(self, group_type: GroupType, record: CandidateRecord) -> List[str]:

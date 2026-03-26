@@ -22,7 +22,6 @@ SURVEY_RE = re.compile(
 VILLAGE_RE = re.compile(r"(?:village|moje)\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)", re.IGNORECASE)
 LEASE_DEED_RE = re.compile(r"lease deed", re.IGNORECASE)
 FINAL_ORDER_RE = re.compile(r"final order", re.IGNORECASE)
-ECHALLAN_RE = re.compile(r"(?:e[\s\-]?challan|traffic violation|virtual court)", re.IGNORECASE)
 
 
 def normalize_spaces(value: str) -> str:
@@ -52,9 +51,7 @@ class IdentityCardBuilder:
 
         survey_number = self._extract_survey_number(filename, sample_text)
         village = self._extract_village(filename, sample_text)
-        challan_number = self._extract_challan_number(filename, sample_text)
         order_number = self._extract_order_number(sample_text)
-        vehicle_number = self._extract_vehicle_number(sample_text)
 
         group_type = self._group_type(document_type)
         master_key, grouping_basis = self._master_key(
@@ -62,9 +59,7 @@ class IdentityCardBuilder:
             filename=filename,
             survey_number=survey_number,
             village=village,
-            challan_number=challan_number,
             order_number=order_number,
-            vehicle_number=vehicle_number,
         )
 
         confidence = 0.3
@@ -72,11 +67,7 @@ class IdentityCardBuilder:
             confidence += 0.3
         if group_type == GroupType.NA and village:
             confidence += 0.2
-        if group_type == GroupType.ECHALLAN and challan_number:
-            confidence += 0.5
         if order_number:
-            confidence += 0.1
-        if vehicle_number:
             confidence += 0.1
 
         return IdentityCard(
@@ -88,9 +79,7 @@ class IdentityCardBuilder:
             grouping_basis=grouping_basis,
             survey_number=survey_number,
             village=village,
-            challan_number=challan_number,
             order_number=order_number,
-            vehicle_number=vehicle_number,
             confidence=min(confidence, 0.99),
             sample_text=sample_text[:3000],
         )
@@ -112,15 +101,11 @@ class IdentityCardBuilder:
             return DocumentType.NA_ORDER
         if LEASE_DEED_RE.search(lowered_name) or LEASE_DEED_RE.search(lowered_text):
             return DocumentType.NA_LEASE
-        if ECHALLAN_RE.search(lowered_name) or ECHALLAN_RE.search(lowered_text) or CHALLAN_NUMBER_RE.search(sample_text):
-            return DocumentType.ECHALLAN
         return DocumentType.UNKNOWN
 
     def _group_type(self, document_type: DocumentType) -> GroupType:
         if document_type in {DocumentType.NA_ORDER, DocumentType.NA_LEASE}:
             return GroupType.NA
-        if document_type == DocumentType.ECHALLAN:
-            return GroupType.ECHALLAN
         return GroupType.UNKNOWN
 
     def _extract_survey_number(self, filename: str, sample_text: str) -> str:
@@ -149,20 +134,9 @@ class IdentityCardBuilder:
 
         return ""
 
-    def _extract_challan_number(self, filename: str, sample_text: str) -> str:
-        for haystack in (sample_text, filename):
-            match = CHALLAN_NUMBER_RE.search(haystack or "")
-            if match:
-                return normalize_spaces(match.group(1)).upper()
-        return ""
-
     def _extract_order_number(self, sample_text: str) -> str:
         match = ORDER_NUMBER_RE.search(sample_text or "")
         return match.group(0).upper() if match else ""
-
-    def _extract_vehicle_number(self, sample_text: str) -> str:
-        match = VEHICLE_NUMBER_RE.search((sample_text or "").upper())
-        return match.group(0) if match else ""
 
     def _master_key(
         self,
@@ -170,9 +144,7 @@ class IdentityCardBuilder:
         filename: str,
         survey_number: str,
         village: str,
-        challan_number: str,
         order_number: str,
-        vehicle_number: str,
     ) -> tuple[str, str]:
         if document_type in {DocumentType.NA_ORDER, DocumentType.NA_LEASE}:
             if survey_number and village:
@@ -185,13 +157,6 @@ class IdentityCardBuilder:
             if order_number:
                 return f"na:order:{normalize_key_fragment(order_number)}", "order_number"
             return f"na:file:{normalize_key_fragment(filename)}", "filename"
-
-        if document_type == DocumentType.ECHALLAN:
-            if challan_number:
-                return f"echallan:{normalize_key_fragment(challan_number)}", "challan_number"
-            if vehicle_number:
-                return f"echallan:vehicle:{normalize_key_fragment(vehicle_number)}", "vehicle_number"
-            return f"echallan:file:{normalize_key_fragment(filename)}", "filename"
 
         return f"unknown:file:{normalize_key_fragment(filename)}", "filename"
 
