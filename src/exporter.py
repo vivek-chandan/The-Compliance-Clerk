@@ -14,8 +14,8 @@ from src.schema import (
 
 def save_results(
     records: Iterable[Union[CandidateRecord, Dict[str, Any]]],
-    excel_path: str = "output/na_results.xlsx",
-    csv_path: str = "output/na_results.csv",
+    excel_path: str = "output/results.xlsx",
+   # csv_path: str = "output/results.csv",
 ) -> None:
     """
     Save results to Excel and CSV formats.
@@ -54,7 +54,7 @@ def save_results(
     # Create DataFrame and export
     dataframe = pd.DataFrame(na_rows).reindex(columns=NA_EXPORT_COLUMNS)
     dataframe.to_excel(excel_target, index=False)
-    dataframe.to_csv(csv_target, index=False)
+  #  dataframe.to_csv(csv_target, index=False)
 
     print(f"Saved {len(dataframe)} records to {excel_target}")
-    print(f"Saved {len(dataframe)} records to {csv_target}")
+  #  print(f"Saved {len(dataframe)} records to {csv_target}")
