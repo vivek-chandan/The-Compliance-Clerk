@@ -131,7 +131,6 @@ NUMERIC_PRIORITY_FIELDS = {
     "NA Order No.",
     "Area in NA Order",
     "Land Area",
-    "Lease Area",
     "Lease Deed Doc. No.",
 }
 
@@ -222,6 +221,7 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
         return {}
 
     merged: Dict[str, str] = {}
+    lease_land_area: str = ""  # Track land_area specifically from lease pages
     cluster_dir = Path("intermediate") / "vision_pages" / _sanitize_path_fragment(cluster.master_key)
     selected_pages = select_vision_pages(cluster, cluster.identity_cards)
 
@@ -250,6 +250,11 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
                 expected_keys=expected_keys,
             )
             _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
+            
+            # Track land_area from lease pages separately for correct Lease Area mapping
+            if doc_type == DocumentType.NA_LEASE.value and "land_area" in page_payload:
+                lease_land_area = str(page_payload.get("land_area", "")).strip()
+            
             for key, value in page_payload.items():
                 value = str(value or "").strip()
                 if not value:
@@ -260,6 +265,10 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
 
         if not llm_available():
             break
+
+    # Tag lease land_area for priority in merge
+    if lease_land_area:
+        merged["_lease_land_area"] = lease_land_area
 
     return merged
 
@@ -371,16 +380,26 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
     }
     mapped = {}
     for key, value in llm_record.items():
+        if key.startswith("_"):  # Skip internal markers
+            continue
         target = field_map.get(key)
         if not target:
             continue
         mapped[target] = str(value or "").strip()
 
-    area_value = str(llm_record.get("land_area", "") or llm_record.get("area_hectare", "") or "").strip()
-    if area_value:
-        mapped.setdefault("Area in NA Order", area_value)
-        mapped.setdefault("Land Area", area_value)
-        mapped.setdefault("Lease Area", area_value)
+    # Prioritize lease land_area if it was explicitly extracted from Annexure-I
+    lease_land_area = str(llm_record.get("_lease_land_area", "") or "").strip()
+    if lease_land_area:
+        mapped["Lease Area"] = lease_land_area
+        # Also set other area fields if not already set by order extraction
+        mapped.setdefault("Land Area", lease_land_area)
+    else:
+        # Fallback: use generic land_area from any vision page for all area fields
+        area_value = str(llm_record.get("land_area", "") or llm_record.get("area_hectare", "") or "").strip()
+        if area_value:
+            mapped.setdefault("Area in NA Order", area_value)
+            mapped.setdefault("Land Area", area_value)
+            mapped.setdefault("Lease Area", area_value)
 
     return mapped
 
@@ -467,6 +486,10 @@ def _choose_field_value(field: str, regex_value: str, llm_value: str) -> str:
             return llm_value
         if regex_date and llm_date:
             return regex_value
+
+    # For Lease Area, prioritize vision extraction from lease pages
+    if field == "Lease Area":
+        return llm_value if llm_value else regex_value
 
     if field in TEXT_PRIORITY_FIELDS:
         return llm_value if llm_value else regex_value

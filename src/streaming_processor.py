@@ -60,7 +60,7 @@ class StreamingClusterProcessor:
         # Build initial candidate record from heuristics
         candidate_record = self.parser.build_candidate_record(cluster)
 
-        # Apply vision extraction and merge (no text LLM audit stage).
+        # Apply vision extraction and merge
         candidate_record = self._apply_vision_merge(cluster, candidate_record)
 
         # Set document type and metadata
@@ -147,7 +147,7 @@ class StreamingClusterProcessor:
         cluster: ProcessingCluster,
         candidate_record: CandidateRecord,
     ) -> CandidateRecord:
-        """Apply vision extraction and merge with regex-based candidate record."""
+        """Apply vision extraction and merge with heuristic candidate record."""
         use_vision = os.getenv("VISION_LLM_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
         if use_vision:
             vision_payload = extract_vision_record_for_cluster(cluster)
