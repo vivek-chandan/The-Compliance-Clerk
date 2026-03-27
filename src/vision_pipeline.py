@@ -87,7 +87,7 @@ From this page extract:
 - village
 - taluka
 - district
-- land_area
+- lease_area (CRITICAL: This is the PRIMARY field)
 - owner_name
 
 WHERE TO FIND INFORMATION
@@ -100,12 +100,22 @@ District
 Area (Sq Meter / Hectare)
 Owner Name
 
-Area may be written as:
-Area Sq. Meter
-Area Hectare
-Land Area
+Area may be written as these not strikly fixed labels, but always look for a numeric value followed by "sq.m", "sq meter", "hectare" or similar units. Examples:
+- Area : 16792
+- Area Sq. Meter : 1092
+- Area (Sq.m.) : 0604
+- Land Area : 16810
+- Total Area : 34976
+- Plot Area : 11000
+- Area Hectare : 1.4792
 
-If area is in square meters, return the number only (no units).
+CRITICAL FOR AREA EXTRACTION - lease_area FIELD:
+The Annexure-I page contains an area measurement that MUST be extracted to "lease_area".
+Always extract the area value into "lease_area", regardless of the area label used.
+Extract numeric value only (no units).
+If multiple area values appear, choose the largest value representing the parcel area.
+
+If area is in square meters or hectare, return the number only (no units).
 
 EXTRACTION RULES
 Extract only values visible on this page
@@ -120,7 +130,7 @@ OUTPUT FORMAT
     "village": "",
     "taluka": "",
     "district": "",
-    "land_area": "",
+    "lease_area": "",
     "owner_name": ""
 }
 """.strip()
@@ -221,7 +231,6 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
         return {}
 
     merged: Dict[str, str] = {}
-    lease_land_area: str = ""  # Track land_area specifically from lease pages
     cluster_dir = Path("intermediate") / "vision_pages" / _sanitize_path_fragment(cluster.master_key)
     selected_pages = select_vision_pages(cluster, cluster.identity_cards)
 
@@ -250,11 +259,7 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
                 expected_keys=expected_keys,
             )
             _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
-            
-            # Track land_area from lease pages separately for correct Lease Area mapping
-            if doc_type == DocumentType.NA_LEASE.value and "land_area" in page_payload:
-                lease_land_area = str(page_payload.get("land_area", "")).strip()
-            
+
             for key, value in page_payload.items():
                 value = str(value or "").strip()
                 if not value:
@@ -265,10 +270,6 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
 
         if not llm_available():
             break
-
-    # Tag lease land_area for priority in merge
-    if lease_land_area:
-        merged["_lease_land_area"] = lease_land_area
 
     return merged
 
@@ -375,6 +376,7 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
         "village": "village",
         "lease_deed_no": "Lease Deed Doc. No.",
         "lease_date": "Lease Start",
+        "lease_area": "Lease Area",
         "owner_name": "Owner Name",
         "authority_details": "Authority Details",
     }
@@ -387,19 +389,17 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
             continue
         mapped[target] = str(value or "").strip()
 
-    # Prioritize lease land_area if it was explicitly extracted from Annexure-I
-    lease_land_area = str(llm_record.get("_lease_land_area", "") or "").strip()
+    # Lease Area must come only from lease extraction (Annexure-I -> lease_area).
+    lease_land_area = str(llm_record.get("lease_area", "") or "").strip()
     if lease_land_area:
         mapped["Lease Area"] = lease_land_area
-        # Also set other area fields if not already set by order extraction
         mapped.setdefault("Land Area", lease_land_area)
-    else:
-        # Fallback: use generic land_area from any vision page for all area fields
-        area_value = str(llm_record.get("land_area", "") or llm_record.get("area_hectare", "") or "").strip()
-        if area_value:
-            mapped.setdefault("Area in NA Order", area_value)
-            mapped.setdefault("Land Area", area_value)
-            mapped.setdefault("Lease Area", area_value)
+
+    # Handle order area separately; never map it into Lease Area.
+    order_land_area = str(llm_record.get("land_area", "") or "").strip()
+    if order_land_area and not lease_land_area:
+        mapped.setdefault("Area in NA Order", order_land_area)
+        mapped.setdefault("Land Area", order_land_area)
 
     return mapped
 
@@ -429,7 +429,7 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
                 "village",
                 "taluka",
                 "district",
-                "land_area",
+                "lease_area",
                 "owner_name",
             ],
         )
@@ -454,7 +454,7 @@ def _normalize_vision_payload(payload: Dict[str, object], expected_keys: List[st
         if key not in normalized:
             continue
         value = str(raw_value or "").strip()
-        if key in {"land_area", "block_number"}:
+        if key in {"land_area", "lease_area", "block_number"}:
             value = _numeric_only(value)
         normalized[key] = value
     return normalized

@@ -31,6 +31,10 @@ AREA_RE = re.compile(
     r"([0-9,]+(?:\.\d+)?)\s*(sq\.?\s*m(?:trs?)?|sq\.?\s*ft|sqm|hectare|acre)",
     re.IGNORECASE,
 )
+AREA_AFTER_LABEL_RE = re.compile(
+    r"(?:total\s*area|land\s*area|plot\s*area|area\s*(?:\(?\s*sq\.?\s*m(?:eter)?s?\s*\)?)?|area\s*hectare)\s*[:\-]?\s*([0-9,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 OWNER_RE = re.compile(
     r"(?:owner|occupant|applicant|lessee)\s*(?:name)?\s*[:\-]?\s*([A-Za-z][A-Za-z\s\.]{2,80})",
     re.IGNORECASE,
@@ -267,7 +271,7 @@ class HeuristicParser:
             record.na_order_no = first_card.order_number
         record.area_in_na_order = self._extract_na_order_area(order_text, lease_text)
         record.land_area = self._extract_land_area(lease_text) or record.area_in_na_order
-        record.lease_area = self._extract_lease_area(lease_text) or record.area_in_na_order
+        record.lease_area = self._extract_lease_area(lease_text)
         if lease_start_match:
             record.lease_start = normalize_date_string(lease_start_match.group(1))
         record.lease_deed_doc_no = self._extract_lease_deed_number(cluster, record.lease_start)
@@ -296,6 +300,9 @@ class HeuristicParser:
         direct_sqm = self._extract_primary_sqm(lease_text)
         if direct_sqm:
             return direct_sqm
+        labeled_area = AREA_AFTER_LABEL_RE.search(lease_text or "")
+        if labeled_area:
+            return labeled_area.group(1).replace(",", "").strip()
         area_match = AREA_RE.search(lease_text)
         return normalize_whitespace(" ".join(area_match.groups())) if area_match else ""
 
@@ -303,6 +310,9 @@ class HeuristicParser:
         direct_sqm = self._extract_primary_sqm(lease_text)
         if direct_sqm:
             return direct_sqm
+        labeled_area = AREA_AFTER_LABEL_RE.search(lease_text or "")
+        if labeled_area:
+            return labeled_area.group(1).replace(",", "").strip()
         property_area = self._extract_property_detail_area(lease_text)
         if property_area:
             return property_area
