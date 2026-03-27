@@ -21,7 +21,6 @@ NA_EXPORT_COLUMNS = [
     "Sr.no.",
     "Village ",
     "Survey No.",
-    "Block Number",
     "Area in NA Order",
     "Dated",
     "NA Order No.",
@@ -171,12 +170,26 @@ def normalize_payload_keys(payload: Dict[str, object]) -> Dict[str, object]:
     return normalized
 
 
+def _village_from_master_key(master_key: str) -> str:
+    parts = str(master_key or "").split(":")
+    if len(parts) < 3:
+        return ""
+
+    fragment = parts[1].strip().lower()
+    if fragment in {"", "survey", "order", "file", "unknown"}:
+        return ""
+
+    words = fragment.replace("-", " ").split()
+    return " ".join(word.capitalize() for word in words)
+
+
 def to_na_export_row(payload: Dict[str, object]) -> Dict[str, str]:
+    master_key = str(payload.get("Master Key", "") or "")
+    village = _village_from_master_key(master_key) or str(payload.get("village", "") or "")
     return {
         "Sr.no.": str(payload.get("sr no", "") or ""),
-        "Village ": str(payload.get("village", "") or ""),
+        "Village ": village,
         "Survey No.": str(payload.get("survey no", "") or ""),
-        "Block Number": str(payload.get("Block Number", "") or ""),
         "Area in NA Order": str(payload.get("Area in NA Order", "") or ""),
         "Dated": str(payload.get("Dated", "") or ""),
         "NA Order No.": str(payload.get("NA Order No.", "") or ""),

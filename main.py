@@ -34,6 +34,15 @@ def assign_serial_numbers(records: list[CandidateRecord]) -> None:
         record.sr_no = str(index)
 
 
+def _master_key_to_village(master_key: str) -> str:
+    """Extract a readable village label from master key when village is missing."""
+    parts = (master_key or "").split(":")
+    if len(parts) < 3:
+        return ""
+    fragment = parts[1].replace("-", " ").strip()
+    return " ".join(word.capitalize() for word in fragment.split())
+
+
 def main() -> None:
     """
     Main processing pipeline with streaming architecture.
@@ -92,6 +101,13 @@ def main() -> None:
 
     # Load all results from disk and export
     all_results = storage.load_all_results()
+
+    # Results persisted during streaming still have empty sr no; assign before export.
+    for index, row in enumerate(all_results, start=1):
+        row["sr no"] = str(index)
+        if not str(row.get("village", "") or "").strip():
+            row["village"] = _master_key_to_village(str(row.get("Master Key", "")))
+
     save_results(all_results)
 
     # Print summary
