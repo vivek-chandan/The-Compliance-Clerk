@@ -22,6 +22,10 @@ SURVEY_RE = re.compile(
     r"(?:survey|block|s\.?\s*no\.?)\s*[:\-]?\s*([0-9]+(?:[\/\-]?[A-Za-z0-9]+)*)",
     re.IGNORECASE,
 )
+BLOCK_RE = re.compile(
+    r"(?:block(?:\s*no\.?)?|survey\s*/\s*block\s*no\.?)\s*[:\-]?\s*([0-9]+(?:[\/\-]?[A-Za-z0-9]+)*)",
+    re.IGNORECASE,
+)
 VILLAGE_RE = re.compile(r"(?:village|moje)\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)", re.IGNORECASE)
 AREA_RE = re.compile(
     r"([0-9,]+(?:\.\d+)?)\s*(sq\.?\s*m(?:trs?)?|sq\.?\s*ft|sqm|hectare|acre)",
@@ -230,6 +234,7 @@ class HeuristicParser:
         order_text = self._cluster_text(cluster, {"na_order"})
         lease_text = self._cluster_text(cluster, {"na_lease"})
         survey_match = SURVEY_RE.search(order_text or text)
+        block_match = BLOCK_RE.search(order_text or text)
         village_match = VILLAGE_RE.search(lease_text or order_text or text)
         owner_match = OWNER_RE.search(lease_text)
         authority_match = AUTHORITY_RE.search(order_text or text)
@@ -241,6 +246,9 @@ class HeuristicParser:
             record.survey_no = first_card.survey_number
         elif survey_match:
             record.survey_no = normalize_survey(survey_match.group(1))
+
+        if block_match:
+            record.block_number = normalize_survey(block_match.group(1))
 
         if first_card.village:
             record.village = first_card.village

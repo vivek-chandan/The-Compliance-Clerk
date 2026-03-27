@@ -1,109 +1,158 @@
 # The Compliance Clerk
 
-## Project Overview
+The Compliance Clerk extracts structured NA land-compliance data from PDF sets (NA orders + lease deeds) using a streaming pipeline.
 
-The Compliance Clerk is an automated document processing system designed to extract, audit, and organize critical information from PDF documents, specifically focusing on NA (Non-Agricultural) orders and leases. It leverages a combination of heuristic (regex-based) extraction, Optical Character Recognition (OCR), and Large Language Models (LLMs) to accurately capture structured data from unstructured or semi-structured documents.
+It combines:
+- heuristic extraction (regex/text rules),
+- targeted OCR fallback,
+- optional vision-based LLM extraction,
+- cluster-level merging,
+- disk-backed intermediate state for low memory usage.
 
-The system aims to streamline compliance-related tasks by automating the data extraction process, reducing manual effort, and improving data accuracy.
+## What It Does
 
-## Features
+- Discovers PDFs recursively under `data/raw_pdfs/`
+- Builds lightweight identity cards for each document
+- Groups related files into clusters (for example, order + lease for the same survey/village)
+- Processes clusters and creates normalized candidate records
+- Optionally enriches records with vision LLM extraction
+- Exports NA records to CSV and Excel
 
--   **PDF Document Processing**: Extracts text directly from PDF documents and performs OCR on pages with sparse or image-based text to ensure comprehensive data capture.
--   **Document Classification**: Automatically classifies incoming PDF documents into types such as `NA Order` and `NA Lease`.
--   **Heuristic Data Extraction**: Utilizes a robust set of regular expressions to identify and extract key fields from document text.
--   **Intelligent Document Grouping**: Groups related documents (e.g., an NA Order and its corresponding NA Lease) into `ProcessingCluster`s based on common identifiers like survey numbers or challan numbers.
--   **LLM-Powered Auditing and Refinement**: Integrates with Large Language Models (LLMs) to audit and refine heuristically extracted data, fill missing fields, and correct inaccuracies based on the document's context. This feature enhances the accuracy and completeness of the extracted information.
--   **Configurable Field Keywords**: Allows for easy modification and extension of keywords used in heuristic extraction for different document types.
--   **Structured Data Export**: Exports extracted and audited NA data into organized Excel (`.xlsx`) and CSV (`.csv`) formats.
--   **Comprehensive Logging**: Logs LLM interactions and schema validation errors for transparency, debugging, and continuous improvement.
+## Current Architecture (Streaming + Disk Backed)
 
-## Getting Started
+The runtime in `main.py` uses a 4-phase streaming flow:
 
-Follow these instructions to set up and run the project on your local machine.
+1. Discover PDFs and build identity cards
+2. Group identity cards into processing clusters
+3. Process clusters and persist results incrementally
+4. Export final NA records
 
-### Prerequisites
+Intermediate artifacts are written to JSONL files in `intermediate/`:
+- `identity_cards.jsonl`
+- `clusters.jsonl`
+- `results.jsonl`
 
--   **Python 3.9+**: The project is developed using Python.
--   **pip**: Python's package installer, usually comes with Python.
--   **Tesseract OCR**: An open-source OCR engine. You need to install Tesseract on your system and ensure it's in your system's PATH.
-    -   **macOS**: `brew install tesseract`
-    -   **Ubuntu/Debian**: `sudo apt-get install tesseract-ocr`
-    -   **Windows**: Download the installer from Tesseract-OCR GitHub.
+This keeps memory usage low compared to all-in-memory batch processing.
 
-### Installation
+## Requirements
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/vivek-chandan/The-Compliance-Clerk.git
-    cd The-Compliance-Clerk
-    ```
+- Python 3.10+
+- Tesseract OCR installed and available on PATH
 
-2.  **Create and activate a virtual environment**:
-    It's highly recommended to use a virtual environment to manage project dependencies.
-    ```bash
-    python -m venv venv
-    source venv/bin/activate # On macOS/Linux
-    # venv\Scripts\activate # On Windows
-    ```
+Install Tesseract:
+- Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
+- macOS: `brew install tesseract`
+- Windows: install from official Tesseract builds and add to PATH
 
-3.  **Install project dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+Python packages are listed in `requirements.txt`.
 
-### API Key Setup for LLM (Optional)
+## Setup
 
-To enable LLM-powered auditing, you need to provide an API key for your chosen LLM provider (e.g., OpenAI, OpenRouter).
+```bash
+git clone https://github.com/vivek-chandan/The-Compliance-Clerk.git
+cd The-Compliance-Clerk
 
-1.  Create a `.env` file in the root directory of the project.
-2.  Add your API key to the `.env` file. For example:
-    -   For OpenAI:
-        ```
-        OPENAI_API_KEY="your_openai_api_key_here"
-        ```
-    -   For OpenRouter:
-        ```
-        LLM_PROVIDER="openrouter"
-        OPENROUTER_API_KEY="your_openrouter_api_key_here"
-        ```
-    You can also specify the LLM model to use (e.g., `LLM_MODEL="gpt-4.1-mini"`). If no API key is found, the system will run in heuristic-only mode.
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+## LLM Configuration (Optional)
+
+Create a `.env` file in the project root if you want vision extraction through an LLM provider.
+
+OpenAI example:
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_key_here
+```
+
+OpenRouter example:
+
+```env
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_key_here
+# Optional override:
+# OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+```
+
+If no valid provider key is found, the pipeline automatically runs in regex/OCR-only mode.
+
+## Runtime Controls
+
+Environment variables:
+
+- `VISION_LLM_ENABLED` (default: `true`)
+  - `true`: run vision page extraction and merge into record
+  - `false`: skip vision stage entirely
+- `PARALLEL_CLUSTERS` (default: `true`)
+  - `true`: process clusters concurrently with thread pool
+  - `false`: process clusters sequentially
+- `CLUSTER_MAX_WORKERS` (default: `4`, capped by CPU count)
+  - controls worker count when parallel processing is enabled
 
 ## Usage
 
-1.  **Place your PDF documents**:
-    Put all the PDF files you want to process into the `data/raw_pdfs/` directory. The system will recursively search this directory.
+1. Put PDFs in `data/raw_pdfs/` (recursive folders are supported).
+2. Run:
 
-2.  **Run the main script**:
-    Execute the `main.py` script from the project root directory.
-    ```bash
-    python main.py
-    ```
-
-3.  **View Results**:
-    After execution, the extracted data will be saved in the `output/` directory:
-    -   `na_results.xlsx`: Excel export for NA records.
-    -   `na_results.csv`: CSV export for NA records.
-
-    Log files for LLM interactions and schema errors will be found in the `logs/` directory.
-
-## Project Structure
-
+```bash
+python main.py
 ```
+
+3. Check outputs:
+- `output/results.xlsx`
+
+Note:
+- Export includes records where `Document Type` is `na`.
+- Unknown clusters are skipped.
+- The pipeline currently calls `storage.clear_state()` at run start, so `intermediate/` is reset each run.
+
+## Output and Logs
+
+### Output Files
+
+- `output/results.xlsx`
+
+### Intermediate State
+
+- `intermediate/identity_cards.jsonl`
+- `intermediate/clusters.jsonl`
+- `intermediate/results.jsonl`
+- `intermediate/vision_pages/` (rendered page images for vision extraction)
+- `intermediate/vision_json/` (per-page extracted JSON payloads)
+
+### Logs
+
+- `logs/llm_runtime_events.jsonl` (provider disable / runtime LLM events)
+- `logs/schema_errors.jsonl`
+- `logs/vision_schema_errors.jsonl`
+
+## Project Layout
+
+```text
 The-Compliance-Clerk/
+├── main.py
+├── requirements.txt
 ├── data/
-│   └── raw_pdfs/             # Directory to place input PDF documents
-├── output/                   # Directory for output Excel and CSV files
-├── logs/                     # Directory for LLM interaction and error logs
+│   └── raw_pdfs/
+├── intermediate/
+├── logs/
+├── output/
 ├── src/
-│   ├── __init__.py
-│   ├── exporter.py           # Handles saving processed data to Excel/CSV
-│   ├── grouper.py            # Classifies and groups related PDF documents
-│   ├── llm_handler.py        # Manages interactions with Large Language Models
-│   ├── logger.py             # Provides utility functions for logging
-│   ├── ocr.py                # Performs Optical Character Recognition on PDFs
-│   ├── parser.py             # Implements heuristic (regex-based) data extraction
-│   ├── schema.py             # Defines data models (Pydantic) and field keywords
-│   └── validator.py          # Cleans and validates JSON output from LLMs
-├── main.py                   # Main entry point of the application
-└── requirements.txt          # Lists all Python dependencies
+│   ├── exporter.py
+│   ├── grouper.py
+│   ├── llm_handler.py
+│   ├── logger.py
+│   ├── ocr.py
+│   ├── parser.py
+│   ├── schema.py
+│   ├── storage.py
+│   ├── streaming_processor.py
+│   ├── validator.py
+│   └── vision_pipeline.py
+└── README.md
+```
 

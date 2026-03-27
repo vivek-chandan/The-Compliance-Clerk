@@ -18,40 +18,116 @@ from src.parser import find_annexure_page, get_target_pages
 from src.schema import CandidateRecord, DocumentType, ProcessingCluster, normalize_payload_keys
 
 
-VISION_PROMPT = """
-You are extracting structured land record information from this document page.
+NA_ORDER_FIRST_PAGE_PROMPT = """
+You are extracting structured land information from the FIRST PAGE of a Gujarat NA Order document.
 
-Extract the following fields if present:
+This is an NA Order first page. The important information is located in fixed positions.
+
+Extract the following fields if visible on this page:
 - na_order_no
 - order_date
+- district
+- taluka
+- village
+- survey_number
+- block_number
+- land_area
+- authority_details
+
+WHERE TO FIND INFORMATION
+na_order_no
+Located at the TOP of the page near:
+"Hukam No." or "Order No."
+
+order_date
+Located near the top section of the page.
+Format: DD/MM/YYYY
+
+district, taluka, village, survey_number, block_number, land_area
+These appear together in a paragraph describing the land.
+Look for a sentence containing:
+District ___ Taluka ___ Village ___ Survey/Block No ___ Area ___ sq.m.
+
+Extract values from that paragraph.
+
+authority_details
+Located at the bottom of the page above signature.
+Contains officer name and designation like:
+Deputy Collector / District Collector / Prant Officer / Mamlatdar
+
+EXTRACTION RULES
+Extract only values visible on this page
+Do not guess values
+Remove commas from numbers
+Land area should be numeric only
+Return STRICT JSON only
+If value not present, return empty string
+
+OUTPUT FORMAT
+{
+    "na_order_no": "",
+    "order_date": "",
+    "survey_number": "",
+    "block_number": "",
+    "village": "",
+    "taluka": "",
+    "district": "",
+    "land_area": "",
+    "authority_details": ""
+}
+""".strip()
+
+NA_LEASE_ANNEXURE_PROMPT = """
+You are extracting land parcel information from an ANNEXURE-I page of a Gujarat NA Lease document.
+
+Annexure-I usually contains "Description of Subject Land".
+
+From this page extract:
 - survey_number
 - village
 - taluka
 - district
-- area_hectare
-- lease_deed_no
-- lease_date
+- land_area
 - owner_name
-- authority_details
 
-Return STRICT JSON only with string values and these exact keys:
+WHERE TO FIND INFORMATION
+On Annexure-I page look for fields like:
+Survey No.
+Old Survey No.
+Village
+Taluka
+District
+Area (Sq Meter / Hectare)
+Owner Name
+
+Area may be written as:
+Area Sq. Meter
+Area Hectare
+Land Area
+
+If area is in square meters, return the number only (no units).
+
+EXTRACTION RULES
+Extract only values visible on this page
+Do not guess values
+Remove commas from numbers
+Return STRICT JSON only
+If value not present, return empty string
+
+OUTPUT FORMAT
 {
-  "na_order_no": "",
-  "order_date": "",
-  "survey_number": "",
-  "village": "",
-  "taluka": "",
-  "district": "",
-  "area_hectare": "",
-  "lease_deed_no": "",
-  "lease_date": "",
-  "owner_name": "",
-  "authority_details": ""
+    "survey_number": "",
+    "village": "",
+    "taluka": "",
+    "district": "",
+    "land_area": "",
+    "owner_name": ""
 }
 """.strip()
 
 NUMERIC_PRIORITY_FIELDS = {
     "survey no",
+    "Block Number",
     "NA Order No.",
     "Area in NA Order",
     "Land Area",
@@ -67,11 +143,15 @@ TEXT_PRIORITY_FIELDS = {
 
 
 def select_vision_pages(cluster: ProcessingCluster, identity_cards: Iterable[object]) -> List[tuple[str, str, int, str]]:
-    """Select minimal set of pages for vision processing and skip unknown documents."""
+    """Select fixed target pages for vision processing and skip unknown documents."""
     pages_to_process: List[tuple[str, str, int, str]] = []
     for card in identity_cards:
         doc_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
         if doc_type == DocumentType.UNKNOWN.value:
+            continue
+
+        if doc_type == DocumentType.NA_ORDER.value:
+            pages_to_process.append((card.file_path, card.filename, 0, doc_type))
             continue
 
         if doc_type == DocumentType.NA_LEASE.value:
@@ -160,11 +240,14 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
         for image_path, page_number in zip(image_paths, [page_num]):
             if not llm_available():
                 break
+            prompt, expected_keys = _prompt_and_keys_for_doc_type(doc_type)
             page_payload = _extract_page_json(
                 image_path=image_path,
                 master_key=cluster.master_key,
                 doc_type=doc_type,
                 page_number=page_number + 1,
+                prompt=prompt,
+                expected_keys=expected_keys,
             )
             _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
             for key, value in page_payload.items():
@@ -210,6 +293,8 @@ def _extract_page_json(
     master_key: str,
     doc_type: str,
     page_number: int,
+    prompt: str,
+    expected_keys: List[str],
 ) -> Dict[str, str]:
     if not llm_available():
         return {}
@@ -228,7 +313,7 @@ def _extract_page_json(
             max_completion_tokens=int(os.getenv("VISION_MAX_OUTPUT_TOKENS", "700")),
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": VISION_PROMPT},
+                {"role": "system", "content": prompt},
                 {
                     "role": "user",
                     "content": [
@@ -269,7 +354,7 @@ def _extract_page_json(
 
     if not isinstance(payload, dict):
         return {}
-    return {str(key): str(value or "").strip() for key, value in payload.items()}
+    return _normalize_vision_payload(payload, expected_keys)
 
 
 def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str]:
@@ -277,6 +362,7 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
         "na_order_no": "NA Order No.",
         "order_date": "Dated",
         "survey_number": "survey no",
+        "block_number": "Block Number",
         "village": "village",
         "lease_deed_no": "Lease Deed Doc. No.",
         "lease_date": "Lease Start",
@@ -290,13 +376,75 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
             continue
         mapped[target] = str(value or "").strip()
 
-    area_value = str(llm_record.get("area_hectare", "") or "").strip()
+    area_value = str(llm_record.get("land_area", "") or llm_record.get("area_hectare", "") or "").strip()
     if area_value:
         mapped.setdefault("Area in NA Order", area_value)
         mapped.setdefault("Land Area", area_value)
         mapped.setdefault("Lease Area", area_value)
 
     return mapped
+
+
+def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
+    lowered = (doc_type or "").strip().lower()
+    if lowered == DocumentType.NA_ORDER.value:
+        return (
+            NA_ORDER_FIRST_PAGE_PROMPT,
+            [
+                "na_order_no",
+                "order_date",
+                "survey_number",
+                "block_number",
+                "village",
+                "taluka",
+                "district",
+                "land_area",
+                "authority_details",
+            ],
+        )
+    if lowered == DocumentType.NA_LEASE.value:
+        return (
+            NA_LEASE_ANNEXURE_PROMPT,
+            [
+                "survey_number",
+                "village",
+                "taluka",
+                "district",
+                "land_area",
+                "owner_name",
+            ],
+        )
+
+    return NA_ORDER_FIRST_PAGE_PROMPT, [
+        "na_order_no",
+        "order_date",
+        "survey_number",
+        "block_number",
+        "village",
+        "taluka",
+        "district",
+        "land_area",
+        "authority_details",
+    ]
+
+
+def _normalize_vision_payload(payload: Dict[str, object], expected_keys: List[str]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {key: "" for key in expected_keys}
+    for raw_key, raw_value in payload.items():
+        key = str(raw_key or "").strip()
+        if key not in normalized:
+            continue
+        value = str(raw_value or "").strip()
+        if key in {"land_area", "block_number"}:
+            value = _numeric_only(value)
+        normalized[key] = value
+    return normalized
+
+
+def _numeric_only(value: str) -> str:
+    cleaned = str(value or "").replace(",", "")
+    matches = re.findall(r"\d+(?:\.\d+)?", cleaned)
+    return "".join(matches)
 
 
 def _choose_field_value(field: str, regex_value: str, llm_value: str) -> str:

@@ -21,6 +21,7 @@ NA_EXPORT_COLUMNS = [
     "Sr.no.",
     "Village ",
     "Survey No.",
+    "Block Number",
     "Area in NA Order",
     "Dated",
     "NA Order No.",
@@ -64,6 +65,7 @@ class CandidateRecord(BaseModel):
     authority_details: str = Field(default="", alias="Authority Details")
     village: str = Field(default="", alias="village")
     survey_no: str = Field(default="", alias="survey no")
+    block_number: str = Field(default="", alias="Block Number")
     land_area: str = Field(default="", alias="Land Area")
     area_in_na_order: str = Field(default="", alias="Area in NA Order")
     dated: str = Field(default="", alias="Dated")
@@ -83,6 +85,7 @@ class CandidateRecord(BaseModel):
             "Authority Details",
             "village",
             "survey no",
+            "Block Number",
             "Land Area",
             "Area in NA Order",
             "Dated",
@@ -138,6 +141,8 @@ KEY_ALIASES = {
     "survey no": "survey no",
     "survey number": "survey no",
     "survey_number": "survey no",
+    "block number": "Block Number",
+    "block_number": "Block Number",
     "land area": "Land Area",
     "land_area": "Land Area",
     "area in na order": "Area in NA Order",
@@ -171,6 +176,7 @@ def to_na_export_row(payload: Dict[str, object]) -> Dict[str, str]:
         "Sr.no.": str(payload.get("sr no", "") or ""),
         "Village ": str(payload.get("village", "") or ""),
         "Survey No.": str(payload.get("survey no", "") or ""),
+        "Block Number": str(payload.get("Block Number", "") or ""),
         "Area in NA Order": str(payload.get("Area in NA Order", "") or ""),
         "Dated": str(payload.get("Dated", "") or ""),
         "NA Order No.": str(payload.get("NA Order No.", "") or ""),
