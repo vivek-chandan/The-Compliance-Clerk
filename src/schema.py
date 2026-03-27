@@ -29,20 +29,6 @@ NA_EXPORT_COLUMNS = [
     "Lease Start ",
 ]
 
-NA_FIELD_KEYWORDS = {
-    "Owner Name": ["owner", "occupant", "applicant", "lessee", "name"],
-    "Authority Details": ["collector", "authority", "district", "office", "order by"],
-    "village": ["village", "taluka", "moje"],
-    "survey no": ["survey", "block", "s. no", "s.no"],
-    "Land Area": ["land area", "area", "sq", "hectare", "acre"],
-    "Area in NA Order": ["na area", "area", "sqm", "sq.m", "hectare"],
-    "Dated": ["date", "dated", "order date"],
-    "NA Order No.": ["order no", "iora", "permission no"],
-    "Lease Deed Doc. No.": ["lease deed", "document no", "doc no", "serial no"],
-    "Lease Area": ["lease area", "area", "sq", "sqm"],
-    "Lease Start": ["lease start", "commencement", "period", "effective"],
-}
-
 class IdentityCard(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 

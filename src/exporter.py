@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Dict, Iterable, Union
 
 import pandas as pd
 
@@ -13,11 +13,24 @@ from src.schema import (
 
 
 def save_results(
-    records: Iterable[CandidateRecord],
+    records: Iterable[Union[CandidateRecord, Dict[str, Any]]],
     excel_path: str = "output/na_results.xlsx",
     csv_path: str = "output/na_results.csv",
 ) -> None:
-    rows = [record.to_output_dict() if isinstance(record, CandidateRecord) else record for record in records]
+    """
+    Save results to Excel and CSV formats.
+
+    Args:
+        records: Iterable of CandidateRecord objects or dictionaries
+        excel_path: Output path for Excel file
+        csv_path: Output path for CSV file
+    """
+    # Convert all records to dictionaries
+    rows = [
+        record.to_output_dict() if isinstance(record, CandidateRecord) else record
+        for record in records
+    ]
+
     if not rows:
         print("No data to save.")
         return
@@ -27,11 +40,18 @@ def save_results(
     excel_target.parent.mkdir(parents=True, exist_ok=True)
     csv_target.parent.mkdir(parents=True, exist_ok=True)
 
-    na_rows = [to_na_export_row(row) for row in rows if str(row.get("Document Type", "")).lower() == "na"]
+    # Filter for NA records only
+    na_rows = [
+        to_na_export_row(row)
+        for row in rows
+        if str(row.get("Document Type", "")).lower() == "na"
+    ]
+
     if not na_rows:
         print("No NA records to save.")
         return
 
+    # Create DataFrame and export
     dataframe = pd.DataFrame(na_rows).reindex(columns=NA_EXPORT_COLUMNS)
     dataframe.to_excel(excel_target, index=False)
     dataframe.to_csv(csv_target, index=False)

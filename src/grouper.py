@@ -2,19 +2,13 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Iterable, List
+from typing import Iterable, Iterator, List, Optional
 
-from src.ocr import ocr_selected_pages
-from src.parser import extract_text, pdf_name
+from src.parser import extract_native_text_by_page, get_target_pages, ocr_region_only, pdf_name
 from src.schema import DocumentType, GroupType, IdentityCard, ProcessingCluster
 
 
 ORDER_NUMBER_RE = re.compile(r"iORA/\d+/\d+/\d+/\d+/\d+", re.IGNORECASE)
-CHALLAN_NUMBER_RE = re.compile(
-    r"(?:challan|notice|application)\s*(?:number|no\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,})",
-    re.IGNORECASE,
-)
-VEHICLE_NUMBER_RE = re.compile(r"\b[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}\b")
 SURVEY_RE = re.compile(
     r"(?:survey|block|s\.?\s*no\.?)\s*[:\-]?\s*([0-9]+(?:[\/\-]?[A-Za-z0-9]+)*)",
     re.IGNORECASE,
@@ -85,13 +79,19 @@ class IdentityCardBuilder:
         )
 
     def _sample_document_text(self, pdf_path: str) -> str:
-        parsed_text = extract_text(pdf_path, max_pages=2)
-        if len(normalize_spaces(parsed_text)) >= 80:
-            return parsed_text
+        # Fast classification path: read only the first target page for unknown docs.
+        target_pages = get_target_pages(pdf_path, DocumentType.UNKNOWN.value)
+        if not target_pages:
+            return ""
 
-        ocr_pages = ocr_selected_pages(pdf_path, [0, 1], zoom=2.0)
-        ocr_text = "\n".join(ocr_pages.get(page, "") for page in sorted(ocr_pages))
-        return "\n".join(part for part in [parsed_text, ocr_text] if normalize_spaces(part))
+        page_num = target_pages[0]
+        native_text = extract_native_text_by_page(pdf_path, page_num)
+        if len(normalize_spaces(native_text)) >= 80:
+            return native_text
+
+        # Regional OCR fallback (top title/header) avoids full-page OCR latency.
+        ocr_text = ocr_region_only(pdf_path, page_num, region="title")
+        return "\n".join(part for part in [native_text, ocr_text] if normalize_spaces(part))
 
     def _classify_document(self, filename: str, sample_text: str) -> DocumentType:
         lowered_name = filename.lower()
@@ -196,3 +196,67 @@ class EntityGrouper:
             )
 
         return sorted(clusters, key=lambda cluster: (cluster.group_type, cluster.master_key))
+
+    def group_and_persist(
+        self,
+        identity_cards: Iterable[IdentityCard],
+        storage: Optional[object] = None,
+    ) -> Iterator[ProcessingCluster]:
+        """
+        Group identity cards and persist clusters to disk as they're created.
+
+        This method enables streaming cluster processing without holding all
+        clusters in memory simultaneously.
+
+        Args:
+            identity_cards: Iterator or list of identity cards
+            storage: StorageManager instance for persisting clusters to disk.
+                     If provided, clusters are saved incrementally.
+
+        Yields:
+            ProcessingCluster objects in sorted order
+        """
+        from src.storage import StorageManager
+
+        if storage is None:
+            storage = StorageManager()
+
+        cards = list(identity_cards)
+        survey_to_keys = defaultdict(set)
+        for card in cards:
+            if card.group_type == GroupType.NA and card.survey_number and card.village:
+                survey_to_keys[normalize_key_fragment(card.survey_number)].add(card.master_key)
+
+        grouped = defaultdict(list)
+        for card in cards:
+            group_key = card.master_key
+            if (
+                card.group_type == GroupType.NA
+                and card.survey_number
+                and not card.village
+                and card.grouping_basis == "survey_number"
+            ):
+                matching_keys = sorted(survey_to_keys.get(normalize_key_fragment(card.survey_number), set()))
+                if len(matching_keys) == 1:
+                    group_key = matching_keys[0]
+
+            grouped[(card.group_type, group_key)].append(card)
+
+        # Create and persist clusters in sorted order
+        clusters = []
+        for (group_type, master_key), cards_in_group in grouped.items():
+            cards_in_group = sorted(cards_in_group, key=lambda item: item.filename.lower())
+            cluster = ProcessingCluster(
+                master_key=master_key,
+                group_type=group_type,
+                identity_cards=cards_in_group,
+            )
+            clusters.append(cluster)
+
+        # Sort and persist to disk
+        sorted_clusters = sorted(clusters, key=lambda cluster: (cluster.group_type, cluster.master_key))
+        storage.save_clusters(sorted_clusters)
+
+        # Yield clusters one at a time for streaming processing
+        for cluster in sorted_clusters:
+            yield cluster

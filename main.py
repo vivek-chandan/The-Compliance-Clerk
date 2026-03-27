@@ -5,9 +5,11 @@ from pathlib import Path
 
 from src.exporter import save_results
 from src.grouper import EntityGrouper, IdentityCardBuilder
-from src.llm_handler import audit_candidate_record, llm_available, required_api_key_env
+from src.llm_handler import llm_available, required_api_key_env
 from src.parser import HeuristicParser
-from src.schema import CandidateRecord, GroupType
+from src.schema import CandidateRecord
+from src.storage import StorageManager
+from src.streaming_processor import StreamingClusterProcessor
 
 
 RAW_PDF_DIR = Path("data/raw_pdfs")
@@ -26,69 +28,79 @@ def discover_pdfs() -> list[str]:
     return [path for path in pdf_paths if not Path(path).name.startswith(".")]
 
 
-def assign_serial_numbers(records: list[CandidateRecord]) -> list[CandidateRecord]:
+def assign_serial_numbers(records: list[CandidateRecord]) -> None:
+    """Assign serial numbers to records in place."""
     for index, record in enumerate(records, start=1):
         record.sr_no = str(index)
-    return records
-
-
-def process_cluster(cluster, parser: HeuristicParser) -> CandidateRecord:
-    candidate_record = parser.build_candidate_record(cluster)
-    relevant_fields = parser.relevant_fields(cluster.group_type)
-    missing_fields = parser.missing_fields(cluster.group_type, candidate_record)
-    max_pages = max(3, min(6, len(missing_fields) + 1))
-    selected_pages = parser.select_informative_pages(cluster, candidate_record, max_pages=max_pages)
-
-    audited_record, _, _ = audit_candidate_record(
-        candidate_record=candidate_record,
-        pages=selected_pages,
-        group_type=cluster.group_type,
-        master_key=cluster.master_key,
-        relevant_fields=relevant_fields,
-        missing_fields=missing_fields,
-    )
-    audited_record.document_type = cluster.group_type.value if hasattr(cluster.group_type, "value") else str(cluster.group_type)
-    audited_record.source_files = candidate_record.source_files
-    audited_record.master_key = candidate_record.master_key
-    return audited_record
 
 
 def main() -> None:
+    """
+    Main processing pipeline with streaming architecture.
+
+    Phases:
+    1. Discover PDFs and build identity cards (persisted to disk)
+    2. Group identity cards into clusters (persisted to disk)
+    3. Process clusters one at a time (streaming from disk)
+    4. Export final results to CSV/Excel (from disk-persisted JSON)
+    """
     initialize_workspace()
     pdf_paths = discover_pdfs()
+
     if not pdf_paths:
         print("No PDFs found in data/raw_pdfs.")
         return
 
+    # Initialize components
+    storage = StorageManager()
+    storage.clear_state()  # Start fresh
+
     identity_builder = IdentityCardBuilder()
     grouper = EntityGrouper()
     parser = HeuristicParser()
+    processor = StreamingClusterProcessor(parser)
 
+    # ==================== Phase 1: Build Identity Cards ====================
+    print(f"Discovering {len(pdf_paths)} PDF(s)...")
     identity_cards = [identity_builder.build(path) for path in pdf_paths]
-    clusters = grouper.group(identity_cards)
 
+    # Persist identity cards to disk
+    storage.save_identity_cards(identity_cards)
+    print(f"Persisted {len(identity_cards)} identity card(s) to disk")
+
+    # ==================== Phase 2: Group Documents ====================
+    print("Grouping documents...")
+    clusters = list(grouper.group_and_persist(identity_cards, storage))
+    print(f"Created {len(clusters)} cluster(s)")
+
+    # ==================== Phase 3: Process Clusters (Streaming) ====================
     if not llm_available():
-        print(f"{required_api_key_env()} is not set or invalid. Running with heuristic extraction only.")
+        print(f"Note: {required_api_key_env()} is not set. Running with regex-only extraction (vision disabled).")
 
-    results: list[CandidateRecord] = []
-    skipped_unknown: list[str] = []
-
-    for cluster in clusters:
-        if cluster.group_type == GroupType.UNKNOWN:
-            skipped_unknown.extend(card.filename for card in cluster.identity_cards)
-            continue
-        results.append(process_cluster(cluster, parser))
-
-    if skipped_unknown:
-        skipped_list = ", ".join(sorted(skipped_unknown))
-        print(f"Skipped {len(skipped_unknown)} unsupported PDF(s): {skipped_list}")
+    print("Processing clusters...")
+    # Process clusters from disk one at a time (constant memory usage)
+    cluster_iterator = storage.load_clusters()
+    results = list(processor.process_clusters_streaming(cluster_iterator, storage, show_progress=True))
 
     if not results:
         print("No records extracted.")
         return
 
+    # ==================== Phase 4: Assign Serial Numbers & Export ====================
+    print("Assigning serial numbers and exporting...")
     assign_serial_numbers(results)
-    save_results(results)
+
+    # Load all results from disk and export
+    all_results = storage.load_all_results()
+    save_results(all_results)
+
+    # Print summary
+    state = storage.get_state_summary()
+    print(f"\nProcessing complete!")
+    print(f"  Identity cards: {state['identity_cards_count']}")
+    print(f"  Clusters: {state['clusters_count']}")
+    print(f"  Final results: {state['results_count']}")
+    print(f"  Intermediate storage: {state['storage_dir']}")
 
 
 if __name__ == "__main__":

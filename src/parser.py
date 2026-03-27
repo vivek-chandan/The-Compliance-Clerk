@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List
 
 import fitz
 
-from src.ocr import ocr_selected_pages
 from src.schema import (
-    NA_FIELD_KEYWORDS,
     CandidateRecord,
     GroupType,
     PageText,
@@ -17,13 +17,7 @@ from src.schema import (
 
 
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b")
-DATE_DASH_RE = re.compile(r"\b\d{1,2}-\d{1,2}-\d{4}\b")
 ORDER_NUMBER_RE = re.compile(r"iORA/\d+/\d+/\d+/\d+/\d+", re.IGNORECASE)
-CHALLAN_NUMBER_RE = re.compile(
-    r"(?:challan|notice|application)\s*(?:number|no\.?|#)?\s*[:\-]?\s*([A-Z0-9\-]{6,})",
-    re.IGNORECASE,
-)
-VEHICLE_NUMBER_RE = re.compile(r"\b[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}\b")
 SURVEY_RE = re.compile(
     r"(?:survey|block|s\.?\s*no\.?)\s*[:\-]?\s*([0-9]+(?:[\/\-]?[A-Za-z0-9]+)*)",
     re.IGNORECASE,
@@ -51,6 +45,7 @@ ORDER_AREA_NEAR_SURVEY_RE = re.compile(
     r"(?:survey|block|otot2|s\.?\s*no\.?)[^\n]{0,80}?(\d{1,3}(?:,\d{3})+)(?:\.\d+)?",
     re.IGNORECASE,
 )
+ANNEXURE_RE = re.compile(r"annexure\s*[-:]?\s*(?:1|i)\b", re.IGNORECASE)
 
 
 def pdf_name(pdf_path: str) -> str:
@@ -77,6 +72,82 @@ def extract_text_by_page(pdf_path: str, page_number: int) -> str:
         if 0 <= page_number < document.page_count:
             return document[page_number].get_text()
     return ""
+
+
+def extract_native_text_by_page(pdf_path: str, page_number: int) -> str:
+    """Extract native text from a single page (zero-based)."""
+    return extract_text_by_page(pdf_path, page_number).strip()
+
+
+def ocr_region_only(pdf_path: str, page_num: int, region: str = "header", zoom: float = 2.0) -> str:
+    """
+    OCR a page region for speed.
+
+    Regions:
+    - title: top 15%
+    - header: top 25%
+    - full: entire page
+    """
+    region_ratio = {
+        "title": 0.15,
+        "header": 0.25,
+        "full": 1.0,
+    }
+    ratio = region_ratio.get((region or "").strip().lower(), 0.25)
+
+    with fitz.open(pdf_path) as document:
+        if page_num < 0 or page_num >= document.page_count:
+            return ""
+
+        page = document[page_num]
+        rect = page.rect
+        clip = fitz.Rect(0, 0, rect.width, rect.height * ratio)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / f"page_{page_num + 1}_{region}.png"
+            pix.save(image_path)
+            result = subprocess.run(
+                ["tesseract", str(image_path), "stdout"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout.strip()
+
+
+def find_annexure_page(pdf_path: str, start_page: int = 15, region_scan: float = 0.25) -> int | None:
+    """Detect an Annexure-I style page by scanning the top region of later pages."""
+    with fitz.open(pdf_path) as document:
+        total_pages = document.page_count
+        if total_pages <= 0:
+            return None
+
+        begin = max(0, min(start_page, total_pages - 1))
+        scan_ratio = max(0.05, min(region_scan, 1.0))
+        for page_num in range(begin, total_pages):
+            page = document[page_num]
+            rect = page.rect
+            clip = fitz.Rect(0, 0, rect.width, rect.height * scan_ratio)
+            header_text = normalize_whitespace(page.get_text(clip=clip)).lower()
+            if ANNEXURE_RE.search(header_text):
+                return page_num
+    return None
+
+
+def get_target_pages(pdf_path: str, doc_type: str) -> List[int]:
+    """Return minimal pages per document type to reduce processing overhead."""
+    with fitz.open(pdf_path) as document:
+        if document.page_count <= 0:
+            return []
+
+    lowered = (doc_type or "").strip().lower()
+    if lowered == "na_order":
+        return [0]
+    if lowered == "na_lease":
+        annexure_page = find_annexure_page(pdf_path)
+        return [annexure_page] if annexure_page is not None else [0]
+    return [0]
 
 
 def normalize_whitespace(value: str) -> str:
@@ -117,175 +188,39 @@ class HeuristicParser:
     def collect_cluster_pages(self, cluster: ProcessingCluster) -> List[PageText]:
         pages: List[PageText] = []
         for card in cluster.identity_cards:
-            pages.extend(self._extract_document_pages(card.file_path))
+            document_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
+            pages.extend(self._extract_document_pages(card.file_path, document_type=document_type))
         return pages
 
-    def select_informative_pages(
-        self,
-        cluster: ProcessingCluster,
-        candidate_record: CandidateRecord,
-        max_pages: int = 6,
-    ) -> List[PageText]:
-        pages = self.collect_cluster_pages(cluster)
-        missing_fields = self._missing_fields(cluster.group_type, candidate_record)
-        if not missing_fields:
-            return self._top_scored_pages(cluster, candidate_record, pages, max_pages=3)
-
-        selected: List[PageText] = []
-        seen_pages = set()
-
-        for field_name in missing_fields:
-            best_page = self._best_page_for_field(cluster, pages, field_name)
-            if not best_page:
-                continue
-            page_key = (best_page.filename, best_page.page_number)
-            if page_key in seen_pages:
-                continue
-            selected.append(best_page)
-            seen_pages.add(page_key)
-            if len(selected) >= max_pages:
-                return selected
-
-        for page in self._top_scored_pages(cluster, candidate_record, pages, max_pages=max_pages * 2):
-            page_key = (page.filename, page.page_number)
-            if page_key in seen_pages:
-                continue
-            selected.append(page)
-            seen_pages.add(page_key)
-            if len(selected) >= max_pages:
-                break
-
-        return selected[:max_pages]
-
-    def relevant_fields(self, group_type: GroupType) -> List[str]:
-        return list(self._field_keywords(group_type).keys())
-
-    def missing_fields(self, group_type: GroupType, record: CandidateRecord) -> List[str]:
-        return self._missing_fields(group_type, record)
-
-    def _top_scored_pages(
-        self,
-        cluster: ProcessingCluster,
-        candidate_record: CandidateRecord,
-        pages: List[PageText],
-        max_pages: int,
-    ) -> List[PageText]:
-        missing_fields = self._missing_fields(cluster.group_type, candidate_record)
-        confirmed_values = {
-            value.lower()
-            for key, value in candidate_record.filled_fields().items()
-            if key not in {"Document Type", "Source Files", "Master Key"} and value
-        }
-
-        scored_pages = []
-        for page in pages:
-            normalized_text = page.text.lower()
-            master_key_score = 0
-            for card in cluster.identity_cards:
-                tokens = [card.master_key, card.survey_number, card.village, card.order_number]
-                for token in tokens:
-                    if token and token.lower() in normalized_text:
-                        master_key_score += 3
-
-            keyword_score = 0
-            for field_name in missing_fields:
-                keywords = self._field_keywords(cluster.group_type).get(field_name, [])
-                keyword_score += sum(2 for keyword in keywords if keyword.lower() in normalized_text)
-
-            novelty_score = 0
-            if not confirmed_values:
-                novelty_score += 2
-            else:
-                for token in self._salient_tokens(page.text):
-                    if token.lower() not in confirmed_values:
-                        novelty_score += 1
-
-            redundancy_penalty = 0
-            if confirmed_values and all(value in normalized_text for value in confirmed_values if len(value) > 4):
-                redundancy_penalty = 3
-
-            score = master_key_score + keyword_score + novelty_score - redundancy_penalty
-            if score > 0:
-                scored_pages.append((score, len(page.text), page))
-
-        scored_pages.sort(key=lambda item: (-item[0], -item[1], item[2].filename, item[2].page_number))
-        return [item[2] for item in scored_pages[:max_pages]]
-
-    def _best_page_for_field(
-        self,
-        cluster: ProcessingCluster,
-        pages: List[PageText],
-        field_name: str,
-    ) -> PageText | None:
-        filename_to_type = {
-            card.filename: (card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type))
-            for card in cluster.identity_cards
-        }
-        ranked = []
-        for page in pages:
-            page_text = page.text.lower()
-            score = 0
-            keywords = self._field_keywords(cluster.group_type).get(field_name, [])
-            score += sum(3 for keyword in keywords if keyword.lower() in page_text)
-
-            page_doc_type = filename_to_type.get(page.filename, "")
-            if cluster.group_type == GroupType.NA:
-                if field_name in {"Area in NA Order", "Dated", "NA Order No.", "Authority Details"} and page_doc_type == "na_order":
-                    score += 4
-                if field_name in {"Lease Deed Doc. No.", "Lease Area", "Lease Start", "Owner Name"} and page_doc_type == "na_lease":
-                    score += 4
-            if field_name in {"Area in NA Order", "Lease Area", "Land Area"}:
-                if self._extract_primary_sqm(page.text) or self._extract_property_detail_area(page.text):
-                    score += 5
-            if field_name in {"Dated", "Lease Start"} and DATE_RE.search(page.text):
-                score += 5
-            if field_name == "NA Order No." and ORDER_NUMBER_RE.search(page.text):
-                score += 5
-            if field_name == "Lease Deed Doc. No." and LEASE_DEED_FILENAME_RE.search(page.filename):
-                score += 5
-
-            if score > 0:
-                ranked.append((score, len(page.text), page))
-
-        ranked.sort(key=lambda item: (-item[0], -item[1], item[2].filename, item[2].page_number))
-        return ranked[0][2] if ranked else None
-
-    def _extract_document_pages(self, pdf_path: str) -> List[PageText]:
-        total_pages = page_count(pdf_path)
-        relevant_pages = tuple(self._relevant_page_numbers(total_pages))
-        cache_key = (pdf_path, relevant_pages)
+    def _extract_document_pages(self, pdf_path: str, document_type: str = "unknown") -> List[PageText]:
+        # Cache at (file + doc_type + page targets) to avoid repeated OCR work.
+        relevant_pages = tuple(get_target_pages(pdf_path, document_type))
+        cache_key = (f"{pdf_path}:{document_type}", relevant_pages)
         if cache_key in self._page_cache:
             return self._page_cache[cache_key]
 
         pages: List[PageText] = []
-        with fitz.open(pdf_path) as document:
-            native_texts: Dict[int, str] = {}
-            ocr_candidates = []
-
-            force_ocr = total_pages <= 4
-            for page_number in relevant_pages:
-                page = document[page_number]
-                text = page.get_text().strip()
-                native_texts[page_number] = text
-                if force_ocr or len(text) < 60:
-                    ocr_candidates.append(page_number)
-
-            ocr_texts = ocr_selected_pages(pdf_path, ocr_candidates, zoom=2.0) if ocr_candidates else {}
-
-            for page_number in relevant_pages:
-                native_text = native_texts.get(page_number, "")
-                ocr_text = normalize_whitespace(ocr_texts.get(page_number, ""))
+        for page_number in relevant_pages:
+            native_text = extract_native_text_by_page(pdf_path, page_number)
+            if len(native_text) > 50:
+                text = native_text
+                source = "native"
+            else:
+                # Regional OCR (header/title only) is much faster than full-page OCR.
+                region = "header" if (document_type or "").lower() in {"na_order", "na_lease"} else "title"
+                ocr_text = normalize_whitespace(ocr_region_only(pdf_path, page_number, region=region))
                 text = ocr_text or native_text
                 source = "ocr" if ocr_text else "native"
-                pages.append(
-                    PageText(
-                        file_path=pdf_path,
-                        filename=pdf_name(pdf_path),
-                        page_number=page_number + 1,
-                        text=text,
-                        source=source,
-                    )
+
+            pages.append(
+                PageText(
+                    file_path=pdf_path,
+                    filename=pdf_name(pdf_path),
+                    page_number=page_number + 1,
+                    text=text,
+                    source=source,
                 )
+            )
 
         self._page_cache[cache_key] = pages
         return pages
@@ -331,36 +266,12 @@ class HeuristicParser:
 
         return record
 
-    def _field_keywords(self, group_type: GroupType) -> Dict[str, List[str]]:
-        if group_type == GroupType.NA:
-            return NA_FIELD_KEYWORDS
-        return {}
-
-    def _missing_fields(self, group_type: GroupType, record: CandidateRecord) -> List[str]:
-        relevant_fields = list(self._field_keywords(group_type).keys())
-        payload = record.to_output_dict()
-        return [field for field in relevant_fields if not payload.get(field)]
-
-    def _salient_tokens(self, text: str) -> Sequence[str]:
-        tokens: List[str] = []
-        for pattern in (ORDER_NUMBER_RE, VEHICLE_NUMBER_RE, DATE_RE, AREA_RE):
-            if pattern is AREA_RE:
-                tokens.extend([" ".join(match) for match in pattern.findall(text)])
-            else:
-                for match in pattern.findall(text):
-                    tokens.append(match if isinstance(match, str) else match[0])
-        return [normalize_whitespace(token) for token in tokens if normalize_whitespace(token)]
-
-    def _relevant_page_numbers(self, total_pages: int) -> List[int]:
-        candidate_pages = [0, 1, 2, 3, total_pages - 1]
-        return sorted({page for page in candidate_pages if 0 <= page < total_pages})
-
     def _cluster_text(self, cluster: ProcessingCluster, document_types: set[str]) -> str:
         parts: List[str] = []
         for card in cluster.identity_cards:
             document_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
             if document_type in document_types:
-                parts.extend(page.text for page in self._extract_document_pages(card.file_path))
+                parts.extend(page.text for page in self._extract_document_pages(card.file_path, document_type=document_type))
         return "\n".join(parts)
 
     def _extract_na_order_area(self, order_text: str, lease_text: str) -> str:

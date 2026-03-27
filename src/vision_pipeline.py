@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List
+
+import fitz
+from PIL import Image, ImageOps
+from openai import APIError, AuthenticationError
+
+from src.llm_handler import _client, llm_available, provider_name, register_llm_error
+from src.logger import log_llm, log_schema_error
+from src.parser import find_annexure_page, get_target_pages
+from src.schema import CandidateRecord, DocumentType, ProcessingCluster, normalize_payload_keys
+
+
+VISION_PROMPT = """
+You are extracting structured land record information from this document page.
+
+Extract the following fields if present:
+- na_order_no
+- order_date
+- survey_number
+- village
+- taluka
+- district
+- area_hectare
+- lease_deed_no
+- lease_date
+- owner_name
+- authority_details
+
+Return STRICT JSON only with string values and these exact keys:
+{
+  "na_order_no": "",
+  "order_date": "",
+  "survey_number": "",
+  "village": "",
+  "taluka": "",
+  "district": "",
+  "area_hectare": "",
+  "lease_deed_no": "",
+  "lease_date": "",
+  "owner_name": "",
+  "authority_details": ""
+}
+""".strip()
+
+NUMERIC_PRIORITY_FIELDS = {
+    "survey no",
+    "NA Order No.",
+    "Area in NA Order",
+    "Land Area",
+    "Lease Area",
+    "Lease Deed Doc. No.",
+}
+
+TEXT_PRIORITY_FIELDS = {
+    "village",
+    "Owner Name",
+    "Authority Details",
+}
+
+
+def select_vision_pages(cluster: ProcessingCluster, identity_cards: Iterable[object]) -> List[tuple[str, str, int, str]]:
+    """Select minimal set of pages for vision processing and skip unknown documents."""
+    pages_to_process: List[tuple[str, str, int, str]] = []
+    for card in identity_cards:
+        doc_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
+        if doc_type == DocumentType.UNKNOWN.value:
+            continue
+
+        if doc_type == DocumentType.NA_LEASE.value:
+            annexure_page = find_annexure_page(card.file_path)
+            target_page = annexure_page if annexure_page is not None else 0
+            pages_to_process.append((card.file_path, card.filename, target_page, doc_type))
+            continue
+
+        target_pages = get_target_pages(card.file_path, doc_type)
+        if target_pages:
+            pages_to_process.append((card.file_path, card.filename, target_pages[0], doc_type))
+
+    return pages_to_process
+
+
+def pdf_pages_to_images(
+    pdf_path: str,
+    page_numbers: Iterable[int],
+    output_dir: Path,
+    prefix: str,
+    zoom: float = 2.0,
+) -> List[Path]:
+    """Render selected PDF pages to cropped PNG files for vision extraction."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rendered_paths: List[Path] = []
+    for page_number in page_numbers:
+        image_path = output_dir / f"{prefix}_page_{page_number + 1}.png"
+        render_page_to_png(pdf_path, page_number, image_path)
+        rendered_paths.append(image_path)
+
+    return rendered_paths
+
+
+def render_and_crop_page(pdf_path: str, page_num: int, crop_margins: bool = True) -> Image.Image:
+    """Render a page at 150 DPI and crop surrounding white margins to reduce payload."""
+    with fitz.open(pdf_path) as document:
+        if page_num < 0 or page_num >= document.page_count:
+            raise ValueError(f"Invalid page number {page_num} for {pdf_path}")
+
+        page = document[page_num]
+        matrix = fitz.Matrix(150 / 72, 150 / 72)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+    if not crop_margins:
+        return image
+
+    grayscale = image.convert("L")
+    inverted = ImageOps.invert(grayscale)
+    content_box = inverted.getbbox()
+    if content_box:
+        image = image.crop(content_box)
+    return image
+
+
+def render_page_to_png(pdf_path: str, page_num: int, output_path: Path) -> Path:
+    """Render and save a single page as optimized PNG."""
+    image = render_and_crop_page(pdf_path, page_num, crop_margins=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, "PNG", optimize=True)
+    return output_path
+
+
+def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, str]:
+    """Extract JSON fields from targeted page images and fold page outputs into one dict."""
+    # Early quota check: skip expensive rendering if provider is already unavailable.
+    if not llm_available():
+        return {}
+
+    merged: Dict[str, str] = {}
+    cluster_dir = Path("intermediate") / "vision_pages" / _sanitize_path_fragment(cluster.master_key)
+    selected_pages = select_vision_pages(cluster, cluster.identity_cards)
+
+    for file_path, filename, page_num, doc_type in selected_pages:
+        if not llm_available():
+            break
+
+        image_dir = cluster_dir / _sanitize_path_fragment(filename)
+        image_paths = pdf_pages_to_images(
+            file_path,
+            [page_num],
+            image_dir,
+            prefix=Path(filename).stem,
+        )
+
+        for image_path, page_number in zip(image_paths, [page_num]):
+            if not llm_available():
+                break
+            page_payload = _extract_page_json(
+                image_path=image_path,
+                master_key=cluster.master_key,
+                doc_type=doc_type,
+                page_number=page_number + 1,
+            )
+            _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
+            for key, value in page_payload.items():
+                value = str(value or "").strip()
+                if not value:
+                    continue
+                existing = str(merged.get(key, "")).strip()
+                if not existing or len(value) > len(existing):
+                    merged[key] = value
+
+        if not llm_available():
+            break
+
+    return merged
+
+
+def merge_regex_llm(regex_record: CandidateRecord, llm_record: Dict[str, str]) -> CandidateRecord:
+    """Merge regex extraction with vision extraction using field-aware priority rules."""
+    if not llm_record:
+        return regex_record
+
+    regex_payload = regex_record.to_output_dict()
+    mapped_llm = _map_vision_to_candidate_fields(llm_record)
+    merged: Dict[str, str] = {}
+
+    all_fields = set(regex_payload.keys()) | set(mapped_llm.keys())
+    for field in all_fields:
+        regex_value = str(regex_payload.get(field, "") or "").strip()
+        llm_value = str(mapped_llm.get(field, "") or "").strip()
+        merged[field] = _choose_field_value(field, regex_value, llm_value)
+
+    merged["Document Type"] = regex_payload.get("Document Type", "")
+    merged["Source Files"] = regex_payload.get("Source Files", "")
+    merged["Master Key"] = regex_payload.get("Master Key", "")
+    merged["sr no"] = regex_payload.get("sr no", "")
+
+    normalized = normalize_payload_keys(merged)
+    return CandidateRecord.model_validate(normalized)
+
+
+def _extract_page_json(
+    image_path: Path,
+    master_key: str,
+    doc_type: str,
+    page_number: int,
+) -> Dict[str, str]:
+    if not llm_available():
+        return {}
+
+    model_name = os.getenv("VISION_LLM_MODEL", os.getenv("LLM_MODEL", "gpt-4.1-mini"))
+    image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    user_text = (
+        f"Document type: {doc_type}. Page number: {page_number}. "
+        "Extract only values present on this page image."
+    )
+
+    try:
+        response = _client().chat.completions.create(
+            model=model_name,
+            temperature=0,
+            max_completion_tokens=int(os.getenv("VISION_MAX_OUTPUT_TOKENS", "700")),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": VISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                    ],
+                },
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+    except (AuthenticationError, APIError, ValueError) as error:
+        register_llm_error(error, context="vision")
+        log_schema_error(
+            master_key=master_key,
+            group_type=doc_type,
+            error_message=f"Vision LLM request failed: {error}",
+            raw_response="",
+            log_path="logs/vision_schema_errors.jsonl",
+        )
+        return {}
+
+    log_llm(
+        prompt=f"VISION: {image_path.name}",
+        response=content,
+        metadata={
+            "master_key": master_key,
+            "page_number": page_number,
+            "provider": provider_name(),
+            "vision": True,
+        },
+        log_path="logs/vision_llm_logs.jsonl",
+    )
+
+    try:
+        payload = json.loads(content.strip())
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value or "").strip() for key, value in payload.items()}
+
+
+def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str]:
+    field_map = {
+        "na_order_no": "NA Order No.",
+        "order_date": "Dated",
+        "survey_number": "survey no",
+        "village": "village",
+        "lease_deed_no": "Lease Deed Doc. No.",
+        "lease_date": "Lease Start",
+        "owner_name": "Owner Name",
+        "authority_details": "Authority Details",
+    }
+    mapped = {}
+    for key, value in llm_record.items():
+        target = field_map.get(key)
+        if not target:
+            continue
+        mapped[target] = str(value or "").strip()
+
+    area_value = str(llm_record.get("area_hectare", "") or "").strip()
+    if area_value:
+        mapped.setdefault("Area in NA Order", area_value)
+        mapped.setdefault("Land Area", area_value)
+        mapped.setdefault("Lease Area", area_value)
+
+    return mapped
+
+
+def _choose_field_value(field: str, regex_value: str, llm_value: str) -> str:
+    if regex_value and llm_value and _normalize(regex_value) == _normalize(llm_value):
+        return regex_value
+    if not regex_value:
+        return llm_value
+    if not llm_value:
+        return regex_value
+
+    if field in NUMERIC_PRIORITY_FIELDS:
+        return regex_value
+
+    if field in {"Dated", "Lease Start"}:
+        regex_date = _parse_date(regex_value)
+        llm_date = _parse_date(llm_value)
+        if regex_date and not llm_date:
+            return regex_value
+        if llm_date and not regex_date:
+            return llm_value
+        if regex_date and llm_date:
+            return regex_value
+
+    if field in TEXT_PRIORITY_FIELDS:
+        return llm_value if llm_value else regex_value
+
+    return llm_value if len(llm_value) > len(regex_value) else regex_value
+
+
+def _parse_date(value: str) -> datetime | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+
+    for date_format in ("%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(candidate, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _sanitize_path_fragment(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "")).strip("_") or "unknown"
+
+
+def _save_page_payload(master_key: str, filename: str, page_number: int, payload: Dict[str, str]) -> None:
+    output_dir = Path("intermediate") / "vision_json" / _sanitize_path_fragment(master_key)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{_sanitize_path_fragment(filename)}_page_{page_number}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
