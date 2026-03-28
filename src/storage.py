@@ -101,9 +101,24 @@ class StorageManager:
     # ==================== Results I/O ====================
 
     def save_result(self, record: CandidateRecord) -> None:
-        """Append a single result to disk (streaming write)."""
-        with open(self.results_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record.to_output_dict()) + "\n")
+        """Persist a single result, replacing any existing row with the same Master Key."""
+        payload = record.to_output_dict()
+        master_key = str(payload.get("Master Key", "") or "").strip()
+        rows = list(self.load_results()) if self.results_path.exists() else []
+
+        updated = False
+        if master_key:
+            for index, existing in enumerate(rows):
+                if str(existing.get("Master Key", "") or "").strip() == master_key:
+                    rows[index] = payload
+                    updated = True
+                    break
+        if not updated:
+            rows.append(payload)
+
+        with open(self.results_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
 
     def save_results(self, records: Iterable[CandidateRecord]) -> None:
         """Stream results to disk."""

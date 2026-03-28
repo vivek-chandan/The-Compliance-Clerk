@@ -59,11 +59,12 @@ EXTRACTION RULES
 Extract only values visible on this page
 Do not guess values
 Remove commas from numbers
-Land area should be numeric only
-Return STRICT JSON only
+PRESERVE LEADING ZEROS in all numeric values (e.g., "04047" not "4047")
+Land area should be numeric only but preserve leading zeros
+Return STRICT JSON only with ALL values as strings
 If value not present, return empty string
 
-OUTPUT FORMAT
+OUTPUT FORMAT - ALL VALUES MUST BE STRINGS:
 {
     "na_order_no": "",
     "order_date": "",
@@ -83,6 +84,8 @@ You are extracting land parcel information from an ANNEXURE-I page of a Gujarat 
 Annexure-I usually contains "Description of Subject Land".
 
 From this page extract:
+- lease_deed_no
+- lease_date
 - survey_number
 - village
 - taluka
@@ -91,14 +94,34 @@ From this page extract:
 - owner_name
 
 WHERE TO FIND INFORMATION
-On Annexure-I page look for fields like:
-Survey No.
-Old Survey No.
-Village
-Taluka
-District
-Area (Sq Meter / Hectare)
-Owner Name
+
+lease_deed_no
+Look in the TOP RIGHT CORNER inside the rectangular stamp/box.
+Examples of formats inside that box:
+- 141 / 35 / 54 with year 2026 nearby
+- 141/2026
+Extract only the Lease Deed document number and year.
+Return it in this final format: "141/2026"
+If the box shows multiple slash-separated values like "141 / 35 / 54", use only the FIRST number as the document number.
+If the year near the box and the footer date year do not match, use the footer date year.
+
+lease_date
+Look at the BOTTOM CENTER or BOTTOM RIGHT footer.
+Example:
+- Page 33 of 41, Date: 21-01-2026
+Extract that Date value as lease_date.
+Return date in DD/MM/YYYY format.
+
+survey_number, village, taluka, district, owner_name
+Look in the first table under "Description of Subject Lands".
+
+lease_area
+Look in the FIRST TABLE only.
+The first table columns are like:
+No | District | Taluka | Village | Owner | R.S.No Old | New | Area in SQM
+Extract the value from the LAST COLUMN: "Area in SQM".
+Example:
+- 04047
 
 Area may be written as these not strikly fixed labels, but always look for a numeric value followed by "sq.m", "sq meter", "hectare" or similar units. Examples:
 - Area : 16792
@@ -108,12 +131,13 @@ Area may be written as these not strikly fixed labels, but always look for a num
 - Total Area : 34976
 - Plot Area : 11000
 - Area Hectare : 1.4792
+- Area in SQM : 04047
 
 CRITICAL FOR AREA EXTRACTION - lease_area FIELD:
 The Annexure-I page contains an area measurement that MUST be extracted to "lease_area".
-Always extract the area value into "lease_area", regardless of the area label used.
+Always extract the value from the first table's "Area in SQM" column into "lease_area".
 Extract numeric value only (no units).
-If multiple area values appear, choose the largest value representing the parcel area.
+Do NOT take boundary numbers, page numbers, or other survey numbers as lease_area.
 
 If area is in square meters or hectare, return the number only (no units).
 
@@ -121,18 +145,23 @@ EXTRACTION RULES
 Extract only values visible on this page
 Do not guess values
 Remove commas from numbers
-Return STRICT JSON only
+PRESERVE LEADING ZEROS in all numeric values (e.g., "04047" not "4047", "0604" not "604")
+Return STRICT JSON only with ALL values as strings (not numbers)
 If value not present, return empty string
 
-OUTPUT FORMAT
+OUTPUT FORMAT - ALL VALUES MUST BE STRINGS:
 {
+    "lease_deed_no": "",
+    "lease_date": "",
     "survey_number": "",
     "village": "",
     "taluka": "",
     "district": "",
-    "lease_area": "",
+    "lease_area": "04047",
     "owner_name": ""
 }
+
+CRITICAL: If the area value is "04047", you MUST return "lease_area": "04047" as a STRING, NOT as a number 4047.
 """.strip()
 
 NUMERIC_PRIORITY_FIELDS = {
@@ -141,7 +170,6 @@ NUMERIC_PRIORITY_FIELDS = {
     "NA Order No.",
     "Area in NA Order",
     "Land Area",
-    "Lease Deed Doc. No.",
 }
 
 TEXT_PRIORITY_FIELDS = {
@@ -250,14 +278,25 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
             if not llm_available():
                 break
             prompt, expected_keys = _prompt_and_keys_for_doc_type(doc_type)
-            page_payload = _extract_page_json(
-                image_path=image_path,
-                master_key=cluster.master_key,
-                doc_type=doc_type,
-                page_number=page_number + 1,
-                prompt=prompt,
-                expected_keys=expected_keys,
+            page_payload = (
+                _load_saved_page_payload(cluster.master_key, filename, page_number + 1)
+                or _load_logged_page_payload(cluster.master_key, image_path.name, page_number + 1)
             )
+            if not page_payload:
+                page_payload = _extract_page_json(
+                    image_path=image_path,
+                    master_key=cluster.master_key,
+                    doc_type=doc_type,
+                    page_number=page_number + 1,
+                    prompt=prompt,
+                    expected_keys=expected_keys,
+                )
+            if not any(str(value or "").strip() for value in page_payload.values()):
+                page_payload = (
+                    _load_saved_page_payload(cluster.master_key, filename, page_number + 1)
+                    or _load_logged_page_payload(cluster.master_key, image_path.name, page_number + 1)
+                    or page_payload
+                )
             _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
 
             for key, value in page_payload.items():
@@ -313,7 +352,8 @@ def _extract_page_json(
     image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
     user_text = (
         f"Document type: {doc_type}. Page number: {page_number}. "
-        "Extract only values present on this page image."
+        "Extract only values present on this page image. "
+        "CRITICAL: Return ALL numeric values as STRINGS to preserve leading zeros."
     )
 
     try:
@@ -425,6 +465,8 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
         return (
             NA_LEASE_ANNEXURE_PROMPT,
             [
+                "lease_deed_no",
+                "lease_date",
                 "survey_number",
                 "village",
                 "taluka",
@@ -448,19 +490,45 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
 
 
 def _normalize_vision_payload(payload: Dict[str, object], expected_keys: List[str]) -> Dict[str, str]:
+    """
+    Normalize vision payload while preserving leading zeros in numeric strings.
+    
+    CRITICAL: This function must preserve leading zeros in numeric values.
+    Example: "04047" must remain "04047", not become "4047"
+    """
     normalized: Dict[str, str] = {key: "" for key in expected_keys}
     for raw_key, raw_value in payload.items():
         key = str(raw_key or "").strip()
         if key not in normalized:
             continue
-        value = str(raw_value or "").strip()
+        
+        # Special handling for numeric fields to preserve leading zeros
         if key in {"land_area", "lease_area", "block_number"}:
-            value = _numeric_only(value)
+            # If the LLM returned a number (e.g., 4047), we've already lost the leading zero
+            # If it returned a string (e.g., "04047"), preserve it exactly
+            if isinstance(raw_value, str):
+                # It's already a string - preserve leading zeros
+                value = _numeric_only(raw_value)
+            else:
+                # It's a number - we can't recover lost leading zeros, but convert to string
+                value = _numeric_only(str(raw_value or ""))
+        else:
+            value = str(raw_value or "").strip()
+        
         normalized[key] = value
     return normalized
 
 
 def _numeric_only(value: str) -> str:
+    """
+    Extract numeric value while preserving leading zeros.
+    Removes commas and extracts digits, but maintains leading zeros.
+    
+    Examples:
+    - "04047" -> "04047" (preserves leading zero)
+    - "16,792" -> "16792" (removes comma)
+    - "0604 sq.m" -> "0604" (removes units, preserves leading zero)
+    """
     cleaned = str(value or "").replace(",", "")
     matches = re.findall(r"\d+(?:\.\d+)?", cleaned)
     return "".join(matches)
@@ -477,6 +545,9 @@ def _choose_field_value(field: str, regex_value: str, llm_value: str) -> str:
     if field in NUMERIC_PRIORITY_FIELDS:
         return regex_value
 
+    if field == "Lease Deed Doc. No.":
+        return llm_value if llm_value else regex_value
+
     if field in {"Dated", "Lease Start"}:
         regex_date = _parse_date(regex_value)
         llm_date = _parse_date(llm_value)
@@ -485,10 +556,12 @@ def _choose_field_value(field: str, regex_value: str, llm_value: str) -> str:
         if llm_date and not regex_date:
             return llm_value
         if regex_date and llm_date:
+            if field == "Lease Start":
+                return llm_value
             return regex_value
 
-    # For Lease Area, prioritize vision extraction from lease pages
-    if field == "Lease Area":
+    # Annexure-derived lease fields should prioritize the vision extraction.
+    if field in {"Lease Area", "Lease Start"}:
         return llm_value if llm_value else regex_value
 
     if field in TEXT_PRIORITY_FIELDS:
@@ -522,4 +595,71 @@ def _save_page_payload(master_key: str, filename: str, page_number: int, payload
     output_dir = Path("intermediate") / "vision_json" / _sanitize_path_fragment(master_key)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{_sanitize_path_fragment(filename)}_page_{page_number}.json"
+    if not any(str(value or "").strip() for value in payload.values()):
+        existing = _load_saved_page_payload(master_key, filename, page_number)
+        if existing:
+            return
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _load_saved_page_payload(master_key: str, filename: str, page_number: int) -> Dict[str, str]:
+    path = (
+        Path("intermediate")
+        / "vision_json"
+        / _sanitize_path_fragment(master_key)
+        / f"{_sanitize_path_fragment(filename)}_page_{page_number}.json"
+    )
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    normalized = {str(key): str(value or "").strip() for key, value in payload.items()}
+    return normalized if any(normalized.values()) else {}
+
+
+def _load_logged_page_payload(master_key: str, image_name: str, page_number: int) -> Dict[str, str]:
+    log_path = Path("logs") / "vision_llm_logs.jsonl"
+    if not log_path.exists():
+        return {}
+
+    best_match: Dict[str, str] = {}
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        metadata = record.get("metadata", {}) if isinstance(record, dict) else {}
+        if str(metadata.get("master_key", "")).strip() != str(master_key).strip():
+            continue
+        if int(metadata.get("page_number", 0) or 0) != int(page_number):
+            continue
+        if str(record.get("prompt", "")).strip() != f"VISION: {image_name}":
+            continue
+
+        raw_response = str(record.get("response", "")).strip()
+        if not raw_response:
+            continue
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        normalized = {str(key): str(value or "").strip() for key, value in payload.items()}
+        if any(normalized.values()):
+            best_match = normalized
+            break
+
+    return best_match

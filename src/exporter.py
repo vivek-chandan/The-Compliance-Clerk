@@ -14,8 +14,8 @@ from src.schema import (
 
 def save_results(
     records: Iterable[Union[CandidateRecord, Dict[str, Any]]],
-    excel_path: str = "output/na_results.xlsx",
-    csv_path: str = "output/na_results.csv",
+    excel_path: str = "output/results.xlsx",
+    #csv_path: str = "output/results.csv",
 ) -> None:
     """
     Save results to Excel and CSV formats.
@@ -23,7 +23,7 @@ def save_results(
     Args:
         records: Iterable of CandidateRecord objects or dictionaries
         excel_path: Output path for Excel file
-        csv_path: Output path for CSV file
+    
     """
     # Convert all records to dictionaries
     rows = [
@@ -36,9 +36,11 @@ def save_results(
         return
 
     excel_target = Path(excel_path)
-    csv_target = Path(csv_path)
+   
     excel_target.parent.mkdir(parents=True, exist_ok=True)
-    csv_target.parent.mkdir(parents=True, exist_ok=True)
+ 
+
+    rows = _dedupe_rows_by_master_key(rows)
 
     # Filter for NA records only
     na_rows = [
@@ -54,7 +56,34 @@ def save_results(
     # Create DataFrame and export
     dataframe = pd.DataFrame(na_rows).reindex(columns=NA_EXPORT_COLUMNS)
     dataframe.to_excel(excel_target, index=False)
-    dataframe.to_csv(csv_target, index=False)
+    
 
     print(f"Saved {len(dataframe)} records to {excel_target}")
-    print(f"Saved {len(dataframe)} records to {csv_target}")
+ 
+
+
+def _dedupe_rows_by_master_key(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    best_rows: Dict[str, Dict[str, Any]] = {}
+    passthrough: list[Dict[str, Any]] = []
+
+    for row in rows:
+        master_key = str(row.get("Master Key", "") or "").strip()
+        if not master_key:
+            passthrough.append(row)
+            continue
+        existing = best_rows.get(master_key)
+        if existing is None or _row_score(row) > _row_score(existing):
+            best_rows[master_key] = row
+
+    return list(best_rows.values()) + passthrough
+
+
+def _row_score(row: Dict[str, Any]) -> tuple[int, int]:
+    values = [
+        str(value or "").strip()
+        for key, value in row.items()
+        if key not in {"sr no", "Document Type", "Source Files", "Master Key"}
+    ]
+    filled_count = sum(1 for value in values if value)
+    total_length = sum(len(value) for value in values)
+    return filled_count, total_length
