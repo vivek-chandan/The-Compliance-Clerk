@@ -437,9 +437,10 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
 
     # Handle order area separately; never map it into Lease Area.
     order_land_area = str(llm_record.get("land_area", "") or "").strip()
-    if order_land_area and not lease_land_area:
+    if order_land_area:
         mapped.setdefault("Area in NA Order", order_land_area)
-        mapped.setdefault("Land Area", order_land_area)
+        if not lease_land_area:
+            mapped.setdefault("Land Area", order_land_area)
 
     return mapped
 
