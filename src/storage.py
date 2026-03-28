@@ -28,12 +28,16 @@ class StorageManager:
         self.identity_cards_path = self.intermediate_dir / "identity_cards.jsonl"
         self.clusters_path = self.intermediate_dir / "clusters.jsonl"
         self.results_path = self.intermediate_dir / "results.jsonl"
+        self._result_rows_by_key: Dict[str, Dict[str, Any]] | None = None
+        self._result_order: list[str] | None = None
 
     def clear_state(self) -> None:
         """Clear all intermediate files to start fresh."""
         for path in [self.identity_cards_path, self.clusters_path, self.results_path]:
             if path.exists():
                 path.unlink()
+        self._result_rows_by_key = None
+        self._result_order = None
 
     # ==================== Identity Cards I/O ====================
 
@@ -101,30 +105,39 @@ class StorageManager:
     # ==================== Results I/O ====================
 
     def save_result(self, record: CandidateRecord) -> None:
-        """Persist a single result, replacing any existing row with the same Master Key."""
+        """Persist a single result, appending by default and rewriting only on key collisions."""
         payload = record.to_output_dict()
         master_key = str(payload.get("Master Key", "") or "").strip()
-        rows = list(self.load_results()) if self.results_path.exists() else []
+        if not master_key:
+            with open(self.results_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+            return
 
-        updated = False
-        if master_key:
-            for index, existing in enumerate(rows):
-                if str(existing.get("Master Key", "") or "").strip() == master_key:
-                    rows[index] = payload
-                    updated = True
-                    break
-        if not updated:
-            rows.append(payload)
+        self._ensure_result_index()
+        assert self._result_rows_by_key is not None
+        assert self._result_order is not None
 
+        if master_key not in self._result_rows_by_key:
+            self._result_rows_by_key[master_key] = payload
+            self._result_order.append(master_key)
+            with open(self.results_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+            return
+
+        self._result_rows_by_key[master_key] = payload
         with open(self.results_path, "w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
+            for key in self._result_order:
+                row = self._result_rows_by_key.get(key)
+                if row:
+                    f.write(json.dumps(row) + "\n")
 
     def save_results(self, records: Iterable[CandidateRecord]) -> None:
         """Stream results to disk."""
         with open(self.results_path, "w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record.to_output_dict()) + "\n")
+        self._result_rows_by_key = None
+        self._result_order = None
 
     def load_results(self) -> Iterator[Dict[str, Any]]:
         """Load results from disk one at a time."""
@@ -179,3 +192,29 @@ class StorageManager:
             return 0
         with open(path, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
+
+    def _ensure_result_index(self) -> None:
+        if self._result_rows_by_key is not None and self._result_order is not None:
+            return
+
+        rows_by_key: Dict[str, Dict[str, Any]] = {}
+        order: list[str] = []
+        if self.results_path.exists():
+            with open(self.results_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    master_key = str(row.get("Master Key", "") or "").strip()
+                    if not master_key:
+                        continue
+                    if master_key not in rows_by_key:
+                        order.append(master_key)
+                    rows_by_key[master_key] = row
+
+        self._result_rows_by_key = rows_by_key
+        self._result_order = order

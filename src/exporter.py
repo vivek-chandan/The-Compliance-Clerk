@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Union
 
 import pandas as pd
+from openpyxl.styles import NamedStyle
 
+from src.perf import log_timing
 from src.schema import (
     CandidateRecord,
     NA_EXPORT_COLUMNS,
@@ -25,6 +28,8 @@ def save_results(
         excel_path: Output path for Excel file
     
     """
+    started = time.perf_counter()
+
     # Convert all records to dictionaries
     rows = [
         record.to_output_dict() if isinstance(record, CandidateRecord) else record
@@ -33,6 +38,7 @@ def save_results(
 
     if not rows:
         print("No data to save.")
+        log_timing("export", time.perf_counter() - started, "no rows")
         return
 
     excel_target = Path(excel_path)
@@ -51,14 +57,33 @@ def save_results(
 
     if not na_rows:
         print("No NA records to save.")
+        log_timing("export", time.perf_counter() - started, "no na rows")
         return
 
     # Create DataFrame and export
-    dataframe = pd.DataFrame(na_rows).reindex(columns=NA_EXPORT_COLUMNS)
-    dataframe.to_excel(excel_target, index=False)
-    
+    dataframe = (
+        pd.DataFrame(na_rows)
+        .reindex(columns=NA_EXPORT_COLUMNS)
+        .fillna("")
+        .astype(str)
+    )
+    with pd.ExcelWriter(excel_target, engine="openpyxl") as writer:
+        dataframe.to_excel(writer, index=False)
+        worksheet = writer.book.active
+        text_style = NamedStyle(name="text_style", number_format="@")
+        if "text_style" not in writer.book.named_styles:
+            writer.book.add_named_style(text_style)
+        for row in worksheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.style = "text_style"
+                if cell.value is None:
+                    cell.value = ""
+                else:
+                    cell.value = str(cell.value)
+
 
     print(f"Saved {len(dataframe)} records to {excel_target}")
+    log_timing("export", time.perf_counter() - started, str(excel_target))
  
 
 

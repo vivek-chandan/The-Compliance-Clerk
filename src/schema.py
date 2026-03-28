@@ -60,8 +60,6 @@ class CandidateRecord(BaseModel):
     document_type: str = Field(default="", alias="Document Type")
     source_files: str = Field(default="", alias="Source Files")
     master_key: str = Field(default="", alias="Master Key")
-    owner_name: str = Field(default="", alias="Owner Name")
-    authority_details: str = Field(default="", alias="Authority Details")
     village: str = Field(default="", alias="village")
     survey_no: str = Field(default="", alias="survey no")
     block_number: str = Field(default="", alias="Block Number")
@@ -80,8 +78,6 @@ class CandidateRecord(BaseModel):
             "Document Type",
             "Source Files",
             "Master Key",
-            "Owner Name",
-            "Authority Details",
             "village",
             "survey no",
             "Block Number",
@@ -132,10 +128,6 @@ KEY_ALIASES = {
     "source_files": "Source Files",
     "master key": "Master Key",
     "master_key": "Master Key",
-    "owner name": "Owner Name",
-    "owner_name": "Owner Name",
-    "authority details": "Authority Details",
-    "authority_details": "Authority Details",
     "village": "village",
     "survey no": "survey no",
     "survey number": "survey no",
@@ -197,5 +189,4 @@ def to_na_export_row(payload: Dict[str, object]) -> Dict[str, str]:
         "Lease Area ": str(payload.get("Lease Area", "") or ""),
         "Lease Start ": str(payload.get("Lease Start", "") or ""),
     }
-
 

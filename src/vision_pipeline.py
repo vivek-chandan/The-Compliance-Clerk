@@ -4,17 +4,18 @@ import base64
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-import fitz
-from PIL import Image, ImageOps
 from openai import APIError, AuthenticationError
+from PIL import Image
 
 from src.llm_handler import _client, llm_available, provider_name, register_llm_error
 from src.logger import log_llm, log_schema_error
-from src.parser import find_annexure_page, get_target_pages
+from src.parser import get_target_pages
+from src.perf import log_timing, render_page_image, vision_json_cache
 from src.schema import CandidateRecord, DocumentType, ProcessingCluster, normalize_payload_keys
 
 
@@ -32,7 +33,6 @@ Extract the following fields if visible on this page:
 - survey_number
 - block_number
 - land_area
-- authority_details
 
 WHERE TO FIND INFORMATION
 na_order_no
@@ -49,11 +49,6 @@ Look for a sentence containing:
 District ___ Taluka ___ Village ___ Survey/Block No ___ Area ___ sq.m.
 
 Extract values from that paragraph.
-
-authority_details
-Located at the bottom of the page above signature.
-Contains officer name and designation like:
-Deputy Collector / District Collector / Prant Officer / Mamlatdar
 
 EXTRACTION RULES
 Extract only values visible on this page
@@ -73,8 +68,7 @@ OUTPUT FORMAT - ALL VALUES MUST BE STRINGS:
     "village": "",
     "taluka": "",
     "district": "",
-    "land_area": "",
-    "authority_details": ""
+    "land_area": ""
 }
 """.strip()
 
@@ -91,7 +85,6 @@ From this page extract:
 - taluka
 - district
 - lease_area (CRITICAL: This is the PRIMARY field)
-- owner_name
 
 WHERE TO FIND INFORMATION
 
@@ -112,7 +105,7 @@ Example:
 Extract that Date value as lease_date.
 Return date in DD/MM/YYYY format.
 
-survey_number, village, taluka, district, owner_name
+survey_number, village, taluka, district
 Look in the first table under "Description of Subject Lands".
 
 lease_area
@@ -157,8 +150,7 @@ OUTPUT FORMAT - ALL VALUES MUST BE STRINGS:
     "village": "",
     "taluka": "",
     "district": "",
-    "lease_area": "04047",
-    "owner_name": ""
+    "lease_area": "04047"
 }
 
 CRITICAL: If the area value is "04047", you MUST return "lease_area": "04047" as a STRING, NOT as a number 4047.
@@ -174,8 +166,6 @@ NUMERIC_PRIORITY_FIELDS = {
 
 TEXT_PRIORITY_FIELDS = {
     "village",
-    "Owner Name",
-    "Authority Details",
 }
 
 
@@ -185,16 +175,6 @@ def select_vision_pages(cluster: ProcessingCluster, identity_cards: Iterable[obj
     for card in identity_cards:
         doc_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
         if doc_type == DocumentType.UNKNOWN.value:
-            continue
-
-        if doc_type == DocumentType.NA_ORDER.value:
-            pages_to_process.append((card.file_path, card.filename, 0, doc_type))
-            continue
-
-        if doc_type == DocumentType.NA_LEASE.value:
-            annexure_page = find_annexure_page(card.file_path)
-            target_page = annexure_page if annexure_page is not None else 0
-            pages_to_process.append((card.file_path, card.filename, target_page, doc_type))
             continue
 
         target_pages = get_target_pages(card.file_path, doc_type)
@@ -224,24 +204,7 @@ def pdf_pages_to_images(
 
 def render_and_crop_page(pdf_path: str, page_num: int, crop_margins: bool = True) -> Image.Image:
     """Render a page at 150 DPI and crop surrounding white margins to reduce payload."""
-    with fitz.open(pdf_path) as document:
-        if page_num < 0 or page_num >= document.page_count:
-            raise ValueError(f"Invalid page number {page_num} for {pdf_path}")
-
-        page = document[page_num]
-        matrix = fitz.Matrix(150 / 72, 150 / 72)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-    if not crop_margins:
-        return image
-
-    grayscale = image.convert("L")
-    inverted = ImageOps.invert(grayscale)
-    content_box = inverted.getbbox()
-    if content_box:
-        image = image.crop(content_box)
-    return image
+    return render_page_image(pdf_path, page_num, crop_margins=crop_margins)
 
 
 def render_page_to_png(pdf_path: str, page_num: int, output_path: Path) -> Path:
@@ -254,51 +217,57 @@ def render_page_to_png(pdf_path: str, page_num: int, output_path: Path) -> Path:
 
 def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, str]:
     """Extract JSON fields from targeted page images and fold page outputs into one dict."""
-    # Early quota check: skip expensive rendering if provider is already unavailable.
-    if not llm_available():
-        return {}
-
     merged: Dict[str, str] = {}
     cluster_dir = Path("intermediate") / "vision_pages" / _sanitize_path_fragment(cluster.master_key)
     selected_pages = select_vision_pages(cluster, cluster.identity_cards)
 
     for file_path, filename, page_num, doc_type in selected_pages:
-        if not llm_available():
-            break
-
+        prompt, expected_keys = _prompt_and_keys_for_doc_type(doc_type)
+        page_number = page_num + 1
         image_dir = cluster_dir / _sanitize_path_fragment(filename)
-        image_paths = pdf_pages_to_images(
-            file_path,
-            [page_num],
-            image_dir,
-            prefix=Path(filename).stem,
-        )
+        image_path = image_dir / f"{Path(filename).stem}_page_{page_number}.png"
+        cache_key = (file_path, page_num)
 
-        for image_path, page_number in zip(image_paths, [page_num]):
-            if not llm_available():
-                break
-            prompt, expected_keys = _prompt_and_keys_for_doc_type(doc_type)
-            page_payload = (
-                _load_saved_page_payload(cluster.master_key, filename, page_number + 1)
-                or _load_logged_page_payload(cluster.master_key, image_path.name, page_number + 1)
+        page_payload = vision_json_cache.get(cache_key, {})
+        if not page_payload:
+            page_payload = _load_saved_page_payload(cluster.master_key, filename, page_number)
+            if page_payload:
+                page_payload = _normalize_vision_payload(page_payload, expected_keys)
+                vision_json_cache[cache_key] = page_payload
+        if not page_payload:
+            page_payload = _load_logged_page_payload(cluster.master_key, image_path.name, page_number)
+            if page_payload:
+                page_payload = _normalize_vision_payload(page_payload, expected_keys)
+                vision_json_cache[cache_key] = page_payload
+
+        if not page_payload and llm_available():
+            image_paths = pdf_pages_to_images(
+                file_path,
+                [page_num],
+                image_dir,
+                prefix=Path(filename).stem,
             )
-            if not page_payload:
-                page_payload = _extract_page_json(
-                    image_path=image_path,
-                    master_key=cluster.master_key,
-                    doc_type=doc_type,
-                    page_number=page_number + 1,
-                    prompt=prompt,
-                    expected_keys=expected_keys,
-                )
+            page_payload = _extract_page_json(
+                image_path=image_paths[0],
+                master_key=cluster.master_key,
+                doc_type=doc_type,
+                page_number=page_number,
+                prompt=prompt,
+                expected_keys=expected_keys,
+            )
             if not any(str(value or "").strip() for value in page_payload.values()):
                 page_payload = (
-                    _load_saved_page_payload(cluster.master_key, filename, page_number + 1)
-                    or _load_logged_page_payload(cluster.master_key, image_path.name, page_number + 1)
+                    _load_saved_page_payload(cluster.master_key, filename, page_number)
+                    or _load_logged_page_payload(cluster.master_key, image_path.name, page_number)
                     or page_payload
                 )
-            _save_page_payload(cluster.master_key, filename, page_number + 1, page_payload)
+                if page_payload:
+                    page_payload = _normalize_vision_payload(page_payload, expected_keys)
+            if page_payload:
+                vision_json_cache[cache_key] = page_payload
 
+        if page_payload:
+            _save_page_payload(cluster.master_key, filename, page_number, page_payload)
             for key, value in page_payload.items():
                 value = str(value or "").strip()
                 if not value:
@@ -306,9 +275,6 @@ def extract_vision_record_for_cluster(cluster: ProcessingCluster) -> Dict[str, s
                 existing = str(merged.get(key, "")).strip()
                 if not existing or len(value) > len(existing):
                     merged[key] = value
-
-        if not llm_available():
-            break
 
     return merged
 
@@ -356,6 +322,7 @@ def _extract_page_json(
         "CRITICAL: Return ALL numeric values as STRINGS to preserve leading zeros."
     )
 
+    started = time.perf_counter()
     try:
         response = _client().chat.completions.create(
             model=model_name,
@@ -384,6 +351,8 @@ def _extract_page_json(
             log_path="logs/vision_schema_errors.jsonl",
         )
         return {}
+    finally:
+        log_timing("vision_extraction", time.perf_counter() - started, f"{master_key} page {page_number}")
 
     log_llm(
         prompt=f"VISION: {image_path.name}",
@@ -417,8 +386,6 @@ def _map_vision_to_candidate_fields(llm_record: Dict[str, str]) -> Dict[str, str
         "lease_deed_no": "Lease Deed Doc. No.",
         "lease_date": "Lease Start",
         "lease_area": "Lease Area",
-        "owner_name": "Owner Name",
-        "authority_details": "Authority Details",
     }
     mapped = {}
     for key, value in llm_record.items():
@@ -459,7 +426,6 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
                 "taluka",
                 "district",
                 "land_area",
-                "authority_details",
             ],
         )
     if lowered == DocumentType.NA_LEASE.value:
@@ -473,7 +439,6 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
                 "taluka",
                 "district",
                 "lease_area",
-                "owner_name",
             ],
         )
 
@@ -486,7 +451,6 @@ def _prompt_and_keys_for_doc_type(doc_type: str) -> tuple[str, List[str]]:
         "taluka",
         "district",
         "land_area",
-        "authority_details",
     ]
 
 
@@ -619,7 +583,9 @@ def _load_saved_page_payload(master_key: str, filename: str, page_number: int) -
     if not isinstance(payload, dict):
         return {}
     normalized = {str(key): str(value or "").strip() for key, value in payload.items()}
-    return normalized if any(normalized.values()) else {}
+    if any(normalized.values()):
+        return normalized
+    return {}
 
 
 def _load_logged_page_payload(master_key: str, image_name: str, page_number: int) -> Dict[str, str]:

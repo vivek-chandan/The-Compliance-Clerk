@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List
 
 import fitz
+from PIL import ImageOps
 
+from src.perf import annexure_page_cache, log_timing, ocr_text_cache, render_page_image, vision_json_cache
 from src.schema import (
     CandidateRecord,
     GroupType,
@@ -35,14 +39,6 @@ AREA_AFTER_LABEL_RE = re.compile(
     r"(?:total\s*area|land\s*area|plot\s*area|area\s*(?:\(?\s*sq\.?\s*m(?:eter)?s?\s*\)?)?|area\s*hectare)\s*[:\-]?\s*([0-9,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-OWNER_RE = re.compile(
-    r"(?:owner|occupant|applicant|lessee)\s*(?:name)?\s*[:\-]?\s*([A-Za-z][A-Za-z\s\.]{2,80})",
-    re.IGNORECASE,
-)
-AUTHORITY_RE = re.compile(
-    r"((?:district\s+collector|collector|competent authority|deputy collector)[A-Za-z,\s\-]{0,120})",
-    re.IGNORECASE,
-)
 LEASE_DEED_FILENAME_RE = re.compile(r"Lease Deed No\.[^\d]*(\d+)", re.IGNORECASE)
 DIRECT_SQM_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?\s*square\s*meters?", re.IGNORECASE)
 OUT_OF_SQM_RE = re.compile(r"out of\s*0?(\d{4,})\s*square\s*meter", re.IGNORECASE)
@@ -61,12 +57,17 @@ ORDER_AREA_NEAR_SURVEY_RE = re.compile(
     re.IGNORECASE,
 )
 ANNEXURE_RE = re.compile(r"annexure\s*[-:]?\s*(?:1|i)\b", re.IGNORECASE)
+ANNEXURE_PAGE_RE = re.compile(
+    r"(annexure\s*[-:]?\s*(?:1|i)\b|description\s+of\s+subject\s+lands)",
+    re.IGNORECASE,
+)
 ANNEXURE_AREA_IN_SQM_RE = re.compile(
-    r"Description\s+of\s+Subject\s+Lands.*?Owner\S*\s+Name.*?\|\s*(0?\d{4,}(?:\.\d+)?)\b",
+    r"Description\s+of\s+Subject\s+Lands.*?(?:Area\s+in\s+SQM\s*\|\s*|Area\s+in\s+SQM\s*[:\-]?\s*)(0?\d{4,}(?:\.\d+)?)\b",
     re.IGNORECASE | re.DOTALL,
 )
 LEASE_DEED_DOC_WITH_YEAR_RE = re.compile(r"\b(\d{1,4})\s*/\s*(\d{4})\b")
 LEASE_DEED_DOC_STAMP_RE = re.compile(r"\b(\d{1,4})\s*/\s*\d{1,3}\s*/\s*\d{1,3}\b")
+LEASE_VISION_KEYS = {"lease_deed_no", "lease_date", "survey_number", "village", "taluka", "district", "lease_area", "land_area"}
 
 
 def pdf_name(pdf_path: str) -> str:
@@ -109,53 +110,83 @@ def ocr_region_only(pdf_path: str, page_num: int, region: str = "header", zoom: 
     - header: top 25%
     - full: entire page
     """
+    region_name = (region or "").strip().lower() or "header"
+    cache_key = (pdf_path, page_num, region_name)
+    if cache_key in ocr_text_cache:
+        return ocr_text_cache[cache_key]
+
     region_ratio = {
         "title": 0.15,
         "header": 0.25,
         "full": 1.0,
     }
-    ratio = region_ratio.get((region or "").strip().lower(), 0.25)
+    ratio = region_ratio.get(region_name, 0.25)
 
     with fitz.open(pdf_path) as document:
         if page_num < 0 or page_num >= document.page_count:
+            ocr_text_cache[cache_key] = ""
             return ""
 
-        page = document[page_num]
-        rect = page.rect
-        clip = fitz.Rect(0, 0, rect.width, rect.height * ratio)
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+    started = time.perf_counter()
+    # Reuse the same cropped render for full-page OCR, region OCR, and vision extraction.
+    image = render_page_image(pdf_path, page_num, crop_margins=True)
+    if ratio < 1.0:
+        width, height = image.size
+        image = image.crop((0, 0, width, max(1, int(height * ratio))))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / f"page_{page_num + 1}_{region}.png"
-            pix.save(image_path)
-            result = subprocess.run(
-                ["tesseract", str(image_path), "stdout"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            return result.stdout.strip()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        image_path = Path(temp_dir) / f"page_{page_num + 1}_{region_name}.png"
+        if ratio < 1.0:
+            grayscale = ImageOps.grayscale(image)
+            image = grayscale.point(lambda value: 255 if value > 180 else 0, mode="1")
+        image.save(image_path, "PNG", optimize=True)
+        command = ["tesseract", str(image_path), "stdout"]
+        if ratio < 1.0:
+            command.extend(["--psm", "6"])
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        text = result.stdout.strip()
+
+    ocr_text_cache[cache_key] = text
+    log_timing("ocr", time.perf_counter() - started, f"{Path(pdf_path).name} page {page_num + 1} region={region_name}")
+    return text
 
 
-def find_annexure_page(pdf_path: str, start_page: int = 15, region_scan: float = 0.25) -> int | None:
-    """Detect an Annexure-I style page by scanning the top region of later pages."""
+def find_annexure_page(pdf_path: str, start_page: int | None = None, region_scan: float = 0.15) -> int | None:
+    """Detect an Annexure-I style page by scanning only the tail pages once."""
+    if pdf_path in annexure_page_cache:
+        return annexure_page_cache[pdf_path]
+
+    started = time.perf_counter()
     with fitz.open(pdf_path) as document:
         total_pages = document.page_count
         if total_pages <= 0:
+            annexure_page_cache[pdf_path] = None
             return None
 
-        begin = max(0, min(start_page, total_pages - 1))
+        inferred_start = max(0, total_pages - 25)
+        begin = inferred_start if start_page is None else max(0, min(start_page, total_pages - 1))
         scan_ratio = max(0.05, min(region_scan, 1.0))
         for page_num in range(begin, total_pages):
             page = document[page_num]
             rect = page.rect
             clip = fitz.Rect(0, 0, rect.width, rect.height * scan_ratio)
             header_text = normalize_whitespace(page.get_text(clip=clip)).lower()
-            if ANNEXURE_RE.search(header_text):
+            if ANNEXURE_PAGE_RE.search(header_text):
+                annexure_page_cache[pdf_path] = page_num
+                log_timing("find_annexure_page", time.perf_counter() - started, f"{Path(pdf_path).name} -> page {page_num + 1}")
                 return page_num
             ocr_title = normalize_whitespace(ocr_region_only(pdf_path, page_num, region="title")).lower()
-            if ANNEXURE_RE.search(ocr_title):
+            if ANNEXURE_PAGE_RE.search(ocr_title):
+                annexure_page_cache[pdf_path] = page_num
+                log_timing("find_annexure_page", time.perf_counter() - started, f"{Path(pdf_path).name} -> page {page_num + 1}")
                 return page_num
+    annexure_page_cache[pdf_path] = None
+    log_timing("find_annexure_page", time.perf_counter() - started, f"{Path(pdf_path).name} -> not found")
     return None
 
 
@@ -185,14 +216,107 @@ def normalize_survey(value: str) -> str:
     return normalized
 
 
-def clean_person_name(value: str) -> str:
-    candidate = normalize_whitespace(value)
-    blacklist = ("hereinafter", "collectively referred", "lessor", "lessee", "agreement")
-    if not candidate or any(term in candidate.lower() for term in blacklist):
-        return ""
-    if len(candidate.split()) < 2:
-        return ""
-    return candidate.title()
+def _sanitize_path_fragment(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "")).strip("_") or "unknown"
+
+
+def _expected_image_name(filename: str, page_number: int) -> str:
+    return f"{Path(filename).stem}_page_{page_number}.png"
+
+
+def _load_saved_vision_page_payload(master_key: str, filename: str, page_number: int) -> Dict[str, str]:
+    path = (
+        Path("intermediate")
+        / "vision_json"
+        / _sanitize_path_fragment(master_key)
+        / f"{_sanitize_path_fragment(filename)}_page_{page_number}.json"
+    )
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    normalized = {str(key): str(value or "").strip() for key, value in payload.items()}
+    return normalized if any(normalized.values()) else {}
+
+
+def _load_logged_vision_page_payload(master_key: str, filename: str, page_number: int) -> Dict[str, str]:
+    log_path = Path("logs") / "vision_llm_logs.jsonl"
+    if not log_path.exists():
+        return {}
+
+    expected_prompt = f"VISION: {_expected_image_name(filename, page_number)}"
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        metadata = record.get("metadata", {}) if isinstance(record, dict) else {}
+        if str(metadata.get("master_key", "")).strip() != str(master_key).strip():
+            continue
+        if int(metadata.get("page_number", 0) or 0) != int(page_number):
+            continue
+        if str(record.get("prompt", "")).strip() != expected_prompt:
+            continue
+        raw_response = str(record.get("response", "")).strip()
+        if not raw_response:
+            continue
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        normalized = {str(key): str(value or "").strip() for key, value in payload.items()}
+        if any(normalized.values()):
+            return normalized
+    return {}
+
+
+def load_cached_vision_page_payload(pdf_path: str, master_key: str, filename: str, page_number: int) -> Dict[str, str]:
+    cache_key = (pdf_path, page_number - 1)
+    if cache_key in vision_json_cache:
+        return vision_json_cache[cache_key]
+
+    payload = _load_saved_vision_page_payload(master_key, filename, page_number) or _load_logged_vision_page_payload(
+        master_key, filename, page_number
+    )
+    if payload:
+        payload = {key: value for key, value in payload.items() if key in LEASE_VISION_KEYS}
+        vision_json_cache[cache_key] = payload
+    return payload
+
+
+def _vision_payload_to_text(payload: Dict[str, str], page_number: int) -> str:
+    survey_number = str(payload.get("survey_number", "") or "").strip()
+    district = str(payload.get("district", "") or "").strip()
+    taluka = str(payload.get("taluka", "") or "").strip()
+    village = str(payload.get("village", "") or "").strip()
+    lease_area = str(payload.get("lease_area", "") or payload.get("land_area", "") or "").strip()
+    lease_deed_no = str(payload.get("lease_deed_no", "") or "").strip()
+    lease_date = normalize_date_string(str(payload.get("lease_date", "") or "").strip())
+
+    parts = [
+        "Annexure-I",
+        "Description of Subject Lands",
+        "No | District | Taluka | Village | R.S.No Old | New | Area in SQM",
+        f"1 | {district} | {taluka} | {village} | {survey_number} | {survey_number} | {lease_area}",
+    ]
+    if lease_deed_no:
+        parts.append(f"Lease Deed No.: {lease_deed_no}")
+    if lease_date:
+        parts.append(f"Page {page_number} of {page_number}, Date: {lease_date}")
+    return "\n".join(part for part in parts if part.strip())
 
 
 class HeuristicParser:
@@ -200,23 +324,40 @@ class HeuristicParser:
         self._page_cache: Dict[tuple[str, tuple[int, ...]], List[PageText]] = {}
 
     def build_candidate_record(self, cluster: ProcessingCluster) -> CandidateRecord:
+        started = time.perf_counter()
         source_files = [card.filename for card in cluster.identity_cards]
         record = CandidateRecord.empty(cluster.group_type, cluster.master_key, source_files)
         pages = self.collect_cluster_pages(cluster)
         combined_text = "\n".join(page.text for page in pages)
 
         if cluster.group_type == GroupType.NA:
-            return self._fill_na_record(record, cluster, combined_text)
+            result = self._fill_na_record(record, cluster, combined_text)
+            log_timing("parsing", time.perf_counter() - started, cluster.master_key)
+            return result
+        log_timing("parsing", time.perf_counter() - started, cluster.master_key)
         return record
 
     def collect_cluster_pages(self, cluster: ProcessingCluster) -> List[PageText]:
         pages: List[PageText] = []
         for card in cluster.identity_cards:
             document_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
-            pages.extend(self._extract_document_pages(card.file_path, document_type=document_type))
+            pages.extend(
+                self._extract_document_pages(
+                    card.file_path,
+                    document_type=document_type,
+                    master_key=cluster.master_key,
+                    filename=card.filename,
+                )
+            )
         return pages
 
-    def _extract_document_pages(self, pdf_path: str, document_type: str = "unknown") -> List[PageText]:
+    def _extract_document_pages(
+        self,
+        pdf_path: str,
+        document_type: str = "unknown",
+        master_key: str = "",
+        filename: str = "",
+    ) -> List[PageText]:
         # Cache at (file + doc_type + page targets) to avoid repeated OCR work.
         relevant_pages = tuple(get_target_pages(pdf_path, document_type))
         cache_key = (f"{pdf_path}:{document_type}", relevant_pages)
@@ -230,6 +371,21 @@ class HeuristicParser:
                 text = native_text
                 source = "native"
             else:
+                if (document_type or "").lower() == "na_lease" and master_key:
+                    cached_payload = load_cached_vision_page_payload(pdf_path, master_key, filename or pdf_name(pdf_path), page_number + 1)
+                    if cached_payload:
+                        text = _vision_payload_to_text(cached_payload, page_number + 1)
+                        source = "ocr"
+                        pages.append(
+                            PageText(
+                                file_path=pdf_path,
+                                filename=pdf_name(pdf_path),
+                                page_number=page_number + 1,
+                                text=text,
+                                source=source,
+                            )
+                        )
+                        continue
                 # Lease annexure extraction needs table/footer content, so OCR the full page when native text is absent.
                 region = "full" if (document_type or "").lower() == "na_lease" else "header" if (document_type or "").lower() == "na_order" else "title"
                 ocr_text = normalize_whitespace(ocr_region_only(pdf_path, page_number, region=region))
@@ -256,8 +412,6 @@ class HeuristicParser:
         survey_match = SURVEY_RE.search(order_text or text)
         block_match = BLOCK_RE.search(order_text or text)
         village_match = VILLAGE_RE.search(lease_text or order_text or text)
-        owner_match = OWNER_RE.search(lease_text)
-        authority_match = AUTHORITY_RE.search(order_text or text)
         date_match = DATE_RE.search(order_text)
         order_match = ORDER_NUMBER_RE.search(order_text or text)
         lease_start_value = self._extract_lease_start(lease_text)
@@ -275,10 +429,6 @@ class HeuristicParser:
         elif village_match:
             record.village = normalize_whitespace(village_match.group(1)).title()
 
-        if owner_match:
-            record.owner_name = clean_person_name(owner_match.group(1))
-        if authority_match:
-            record.authority_details = normalize_whitespace(authority_match.group(1))
         if date_match:
             record.dated = date_match.group(0)
         if order_match:
@@ -298,7 +448,15 @@ class HeuristicParser:
         for card in cluster.identity_cards:
             document_type = card.document_type.value if hasattr(card.document_type, "value") else str(card.document_type)
             if document_type in document_types:
-                parts.extend(page.text for page in self._extract_document_pages(card.file_path, document_type=document_type))
+                parts.extend(
+                    page.text
+                    for page in self._extract_document_pages(
+                        card.file_path,
+                        document_type=document_type,
+                        master_key=cluster.master_key,
+                        filename=card.filename,
+                    )
+                )
         return "\n".join(parts)
 
     def _extract_na_order_area(self, order_text: str, lease_text: str) -> str:
@@ -350,6 +508,17 @@ class HeuristicParser:
         match = ANNEXURE_AREA_IN_SQM_RE.search(normalize_whitespace(text or ""))
         if match:
             return match.group(1).replace(",", "").strip()
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            if "area in sqm" not in line.lower():
+                continue
+            for candidate_line in lines[index + 1:index + 4]:
+                cells = [cell.strip() for cell in candidate_line.split("|") if cell.strip()]
+                if not cells:
+                    continue
+                last_cell = cells[-1].replace(",", "").strip()
+                if re.fullmatch(r"0?\d{4,}(?:\.\d+)?", last_cell):
+                    return last_cell
         return ""
 
     def _extract_order_numeric_area(self, text: str) -> str:
